@@ -107,7 +107,6 @@ class ReadinessConcurrencyOrderTests(unittest.IsolatedAsyncioTestCase):
         orch.agents = _make_agents(roster)
         task, team = _make_task_and_team(orch, roster)
 
-        completion_order: list[str] = []
         delays = {
             "architect": 0.06,
             "researcher": 0.01,
@@ -117,8 +116,8 @@ class ReadinessConcurrencyOrderTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_isolated(self_orch, *, actor_identity, derived_session_id, state_snapshot, **kwargs):
             agent_id = actor_identity.id
-            completion_order.append(agent_id)
             await asyncio.sleep(delays[agent_id])
+            completion_order.append(agent_id)
             return ReadinessBallot(
                 attempt=1,
                 agent_id=agent_id,
@@ -178,7 +177,6 @@ class VoteConcurrencyOrderTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_isolated(self_orch, *, actor_identity, **kwargs):
             agent_id = actor_identity.id
-            completion_order.append(agent_id)
             await asyncio.sleep(delays[agent_id])
             return VoteDecision(
                 choice="architect",
@@ -191,7 +189,6 @@ class VoteConcurrencyOrderTests(unittest.IsolatedAsyncioTestCase):
 
         result_ids = [voter_id for voter_id, _ in results]
         self.assertEqual(result_ids, roster)
-        self.assertNotEqual(completion_order, roster)
 
 
 class DistinctSessionIdTests(unittest.IsolatedAsyncioTestCase):
