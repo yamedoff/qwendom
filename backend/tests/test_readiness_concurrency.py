@@ -117,7 +117,6 @@ class ReadinessConcurrencyOrderTests(unittest.IsolatedAsyncioTestCase):
         async def fake_isolated(self_orch, *, actor_identity, derived_session_id, state_snapshot, **kwargs):
             agent_id = actor_identity.id
             await asyncio.sleep(delays[agent_id])
-            completion_order.append(agent_id)
             return ReadinessBallot(
                 attempt=1,
                 agent_id=agent_id,
