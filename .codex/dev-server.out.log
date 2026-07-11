@@ -1,0 +1,25 @@
+
+> dev
+> concurrently "npm:dev:backend" "npm:dev:frontend"
+
+[dev:backend] 
+[dev:backend] > dev:backend
+[dev:backend] > cd backend && uvicorn main:app --reload --port 8000
+[dev:backend] 
+[dev:frontend] 
+[dev:frontend] > dev:frontend
+[dev:frontend] > cd frontend && npm run dev
+[dev:frontend] 
+[dev:backend] 'uvicorn' is not recognized as an internal or external command,
+[dev:backend] operable program or batch file.
+[dev:backend] npm run dev:backend exited with code 1
+[dev:frontend] 
+[dev:frontend] > dev
+[dev:frontend] > vite --host 0.0.0.0
+[dev:frontend] 
+[dev:frontend] [2m8:19:32 p.m.[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m Re-optimizing dependencies because vite config has changed
+[dev:frontend] 
+[dev:frontend]   [32m[1mVITE[22m v6.4.3[39m  [2mready in [0m[1m3659[22m[2m[0m ms[22m
+[dev:frontend] 
+[dev:frontend]   [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5173[22m/[39m
+[dev:frontend]   [32m➜[39m  [1mNetwork[22m: [36mhttp://192.168.100.7:[1m5173[22m/[39m

@@ -1,0 +1,60 @@
+INFO:     127.0.0.1:62126 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62130 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55631 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49337 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62163 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55343 - "OPTIONS /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55343 - "POST /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55343 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57209 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59588 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59588 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57943 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55454 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57209 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57209 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55454 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55454 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57209 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60998 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56942 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56942 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57943 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57943 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57943 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57943 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+ERROR    Rate limit error from OpenAI API: Error code: 429 - {'error':         
+         {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits 
+         to unlock 1000 free model requests per day', 'code': 429, 'metadata': 
+         {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 
+         'X-RateLimit-Reset': '1782518400000'}, 'provider_name': None}},       
+         'user_id': 'user_35WV7gu46p2aLAhv6Yu60o7oiBP'}                        
+ERROR    Error in Team run: Rate limit exceeded: free-models-per-day. Add 10   
+         credits to unlock 1000 free model requests per day                    
+INFO:     127.0.0.1:60998 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53513 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63083 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63083 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53513 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50411 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50411 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60998 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60998 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60998 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60998 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+ERROR    Rate limit error from OpenAI API: Error code: 429 - {'error':         
+         {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits 
+         to unlock 1000 free model requests per day', 'code': 429, 'metadata': 
+         {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 
+         'X-RateLimit-Reset': '1782518400000'}, 'provider_name': None}},       
+         'user_id': 'user_35WV7gu46p2aLAhv6Yu60o7oiBP'}                        
+ERROR    Error in Agent run: Rate limit exceeded: free-models-per-day. Add 10  
+         credits to unlock 1000 free model requests per day                    
+INFO:     127.0.0.1:60998 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55148 - "GET /agents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55148 - "GET /tasks/73f2416e-dc85-4716-8984-38576ba11039/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53513 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55148 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53513 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55148 - "GET /tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53513 - "GET /tasks HTTP/1.1" 200 OK
