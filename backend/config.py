@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     role_specific_tools_enabled: bool = Field(default=True, alias="ROLE_SPECIFIC_TOOLS_ENABLED")
     context7_mcp_enabled: bool = Field(default=True, alias="CONTEXT7_MCP_ENABLED")
     context7_mcp_command: str = Field(default="npx -y @upstash/context7-mcp", alias="CONTEXT7_MCP_COMMAND")
+    readiness_concurrency: int = Field(default=3, alias="READINESS_CONCURRENCY")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

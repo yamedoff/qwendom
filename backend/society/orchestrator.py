@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import copy
 import json
 import time
 from collections import Counter
@@ -975,37 +977,12 @@ class SocietyOrchestrator:
         """Collect readiness ballots from each team member and tally."""
 
         state = self._state(task.id)
+        ballot_results = await self._collect_readiness_ballots_concurrent(task, team, attempt)
         ready_count = 0
         not_ready_count = 0
         blockers: list[str] = []
-        for agent_id in team.member_ids:
+        for agent_id, ballot in ballot_results:
             agent = self.agents[agent_id]
-            latest_statement = next(
-                (
-                    item
-                    for item in reversed(state.get("goal_discussions", []))
-                    if isinstance(item, dict)
-                    and item.get("agent_id") == agent_id
-                    and item.get("round") == state.get("discussion_round_count")
-                ),
-                {},
-            )
-            ballot = await self._run_governance_tool(
-                task=task,
-                actor_identity=agent,
-                tool_func=cast_readiness_vote_tool,
-                tool_name="cast_readiness_vote",
-                schema_class=ReadinessBallot,
-                prompt=(
-                    f"Task: {task.prompt}\n"
-                    f"Your exact agent_id is {agent_id}.\n"
-                    f"Readiness attempt: {attempt}.\n"
-                    f"Your latest discussion statement: {latest_statement}\n"
-                    "Vote whether the society is ready to execute. "
-                    "Set critical_blocker=true only if execution would be misleading without user clarification. "
-                    "Call cast_readiness_vote with your exact agent_id."
-                ),
-            )
             if ballot.ready:
                 ready_count += 1
             else:
@@ -1023,6 +1000,15 @@ class SocietyOrchestrator:
                     ),
                 )
             self._emit(task.id, "readiness_vote_cast", f"{agent.name} cast a readiness vote.", actor=agent_id, payload=ballot.model_dump())
+            self._emit_tool_call(
+                task.id,
+                "cast_readiness_vote",
+                agent_id,
+                f"attempt={attempt}",
+                ballot.model_dump(),
+                "native_agno",
+                not ballot.reason.startswith("Recovered from readiness tool issue"),
+            )
         total = ready_count + not_ready_count
         passed = ready_count > total / 2 and not blockers
         tally = ReadinessTally(
@@ -1037,6 +1023,130 @@ class SocietyOrchestrator:
         state["ready_to_proceed"] = passed if passed else state.get("ready_to_proceed")
         self._emit(task.id, "readiness_vote_tallied", f"Readiness vote tallied for attempt {attempt}.", payload=tally.model_dump())
         return passed
+
+    async def _collect_readiness_ballots_concurrent(
+        self,
+        task: TaskRun,
+        team: Team,
+        attempt: int,
+    ) -> list[tuple[str, ReadinessBallot]]:
+        """Collect readiness ballots in parallel with bounded concurrency.
+
+        Each concurrent model call receives a unique derived session_id and a
+        deep-copied snapshot of session state. No live state is mutated and no
+        events are emitted during collection. Results are returned in the
+        original roster order.
+        """
+
+        state = self._state(task.id)
+        roster = list(team.member_ids)
+        limit = max(1, int(self.settings.readiness_concurrency))
+        semaphore = asyncio.Semaphore(limit)
+
+        async def _collect_one(agent_id: str) -> tuple[str, ReadinessBallot]:
+            agent = self.agents[agent_id]
+            latest_statement = next(
+                (
+                    item
+                    for item in reversed(state.get("goal_discussions", []))
+                    if isinstance(item, dict)
+                    and item.get("agent_id") == agent_id
+                    and item.get("round") == state.get("discussion_round_count")
+                ),
+                {},
+            )
+            derived_session_id = f"{task.id}:readiness:{agent_id}:{uuid4().hex[:8]}"
+            state_snapshot = copy.deepcopy(state)
+            prompt = (
+                f"Task: {task.prompt}\n"
+                f"Your exact agent_id is {agent_id}.\n"
+                f"Readiness attempt: {attempt}.\n"
+                f"Your latest discussion statement: {latest_statement}\n"
+                "Vote whether the society is ready to execute. "
+                "Set critical_blocker=true only if execution would be misleading without user clarification. "
+                "Call cast_readiness_vote with your exact agent_id."
+            )
+            async with semaphore:
+                ballot = await self._run_governance_tool_isolated(
+                    task=task,
+                    actor_identity=agent,
+                    tool_func=cast_readiness_vote_tool,
+                    tool_name="cast_readiness_vote",
+                    schema_class=ReadinessBallot,
+                    prompt=prompt,
+                    derived_session_id=derived_session_id,
+                    state_snapshot=state_snapshot,
+                )
+            return agent_id, ballot
+
+        tasks = [asyncio.create_task(_collect_one(agent_id)) for agent_id in roster]
+        results: list[tuple[str, ReadinessBallot]] = []
+        for coro in asyncio.as_completed(tasks):
+            results.append(await coro)
+        order = {agent_id: idx for idx, agent_id in enumerate(roster)}
+        results.sort(key=lambda pair: order[pair[0]])
+        return results
+
+    async def _collect_votes_concurrent(
+        self,
+        task: TaskRun,
+        team: Team,
+        candidates: list[str],
+    ) -> list[tuple[str, VoteDecision]]:
+        """Collect proposal votes in parallel with bounded concurrency.
+
+        Each concurrent model call receives a unique derived session_id and a
+        deep-copied snapshot of session state. No live state is mutated and no
+        events are emitted during collection. Results are returned in the
+        original roster order.
+        """
+
+        state = self._state(task.id)
+        roster = list(team.member_ids)
+        limit = max(1, int(self.settings.readiness_concurrency))
+        semaphore = asyncio.Semaphore(limit)
+        summary = "\n".join(f"- {cid}: {self.agents[cid].name}, role={self.agents[cid].role}" for cid in candidates)
+
+        if self.settings.native_voting_enabled:
+            tool_func = cast_ballot_tool
+            tool_name = "cast_ballot"
+            tail = "Call the cast_ballot tool with your exact voter_id and decision."
+        else:
+            tool_func = cast_vote_tool
+            tool_name = "cast_vote"
+            tail = "Call the cast_vote tool with your decision."
+
+        async def _collect_one(voter_id: str) -> tuple[str, VoteDecision]:
+            voter = self.agents[voter_id]
+            derived_session_id = f"{task.id}:vote:{voter_id}:{uuid4().hex[:8]}"
+            state_snapshot = copy.deepcopy(state)
+            prompt = (
+                f"Task: {task.prompt}\n"
+                f"Your exact voter_id is {voter_id}.\n"
+                f"Candidates:\n{summary}\n"
+                f"Vote for the best proposal. The choice must be one of: {', '.join(candidates)}.\n"
+                f"{tail}"
+            )
+            async with semaphore:
+                decision = await self._run_governance_tool_isolated(
+                    task=task,
+                    actor_identity=voter,
+                    tool_func=tool_func,
+                    tool_name=tool_name,
+                    schema_class=VoteDecision,
+                    prompt=prompt,
+                    derived_session_id=derived_session_id,
+                    state_snapshot=state_snapshot,
+                )
+            return voter_id, decision
+
+        tasks = [asyncio.create_task(_collect_one(voter_id)) for voter_id in roster]
+        results: list[tuple[str, VoteDecision]] = []
+        for coro in asyncio.as_completed(tasks):
+            results.append(await coro)
+        order = {voter_id: idx for idx, voter_id in enumerate(roster)}
+        results.sort(key=lambda pair: order[pair[0]])
+        return results
 
     async def _compose_working_brief(self, task: TaskRun, team: Team) -> None:
         """Freeze the shared task understanding after readiness passes.
@@ -1513,6 +1623,82 @@ class SocietyOrchestrator:
 
         result_dict = result.model_dump()
         self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], result_dict, "native_agno", True)
+        return result
+
+    async def _run_governance_tool_isolated(
+        self,
+        task: TaskRun,
+        actor_identity: SocietyAgent,
+        tool_func: Any,
+        tool_name: str,
+        schema_class: Type[T],
+        prompt: str,
+        derived_session_id: str,
+        state_snapshot: dict[str, Any],
+        extra_instructions: list[str] | None = None,
+    ) -> T:
+        """Run a governance tool call without mutating live state or emitting events.
+
+        Each concurrent caller receives a unique ``derived_session_id`` and a
+        deep-copied ``state_snapshot`` so parallel model calls cannot observe or
+        corrupt each other. Timeout and fallback semantics match the live path.
+        """
+
+        instructions = [
+            *NATIVE_TOOL_INSTRUCTIONS,
+            f"Use only valid agent ids from this roster: {', '.join(self.agents.keys())}.",
+            *(extra_instructions or []),
+        ]
+
+        agno_agent = build_agno_agent(
+            identity=actor_identity,
+            settings=self.settings,
+            tools=[tool_func],
+            tool_choice={"type": "function", "function": {"name": tool_name}},
+            extra_instructions=instructions,
+            tool_call_limit=1,
+            session_id=derived_session_id,
+            session_state=state_snapshot,
+        )
+
+        try:
+            response = await asyncio.wait_for(
+                agno_agent.arun(prompt),
+                timeout=self.settings.llm_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            if schema_class is ReadinessBallot:
+                return _fallback_readiness_ballot(actor_identity, str(exc))
+            if schema_class is VoteDecision:
+                raise GovernanceToolError(f"Timeout calling {tool_name}: {exc}") from exc
+            raise GovernanceToolError(f"Timeout calling {tool_name}: {exc}") from exc
+        except Exception as exc:
+            raise GovernanceToolError(f"Agent run failed for {tool_name}: {exc}") from exc
+
+        try:
+            result = _extract_tool_result(response, tool_name, schema_class)
+        except ValueError as exc:
+            retry_prompt = (
+                f"{prompt}\n\n"
+                f"Your previous response did not call the required `{tool_name}` tool. "
+                f"Retry now and call `{tool_name}` exactly once. "
+                "Do not explain, summarize, or answer in prose outside the tool call."
+            )
+            try:
+                retry_response = await asyncio.wait_for(
+                    agno_agent.arun(retry_prompt),
+                    timeout=self.settings.llm_timeout_seconds,
+                )
+                result = _extract_tool_result(retry_response, tool_name, schema_class)
+            except (asyncio.TimeoutError, ValueError) as retry_exc:
+                if schema_class is ReadinessBallot:
+                    return _fallback_readiness_ballot(actor_identity, str(retry_exc))
+                raise GovernanceToolError(
+                    f"Could not extract valid tool result for {tool_name} after retry: {retry_exc}"
+                ) from retry_exc
+            except Exception as retry_exc:
+                raise GovernanceToolError(f"Agent retry failed for {tool_name}: {retry_exc}") from retry_exc
+
         return result
 
     def _emit_tool_call(
@@ -2994,29 +3180,14 @@ class SocietyOrchestrator:
         votes = []
         candidates = list(proposals.keys())
 
-        for voter_id in team.member_ids:
-            if self.settings.llm_enabled and self.settings.native_voting_enabled:
-                voter = self.agents[voter_id]
-                summary = "\n".join(f"- {cid}: {self.agents[cid].name}, role={self.agents[cid].role}" for cid in candidates)
-                prompt = (
-                    f"Task: {task.prompt}\n"
-                    f"Your exact voter_id is {voter_id}.\n"
-                    f"Candidates:\n{summary}\n"
-                    f"Vote for the best proposal. The choice must be one of: {', '.join(candidates)}.\n"
-                    "Call the cast_ballot tool with your exact voter_id and decision."
-                )
-                decision = await self._run_governance_tool(
-                    task=task,
-                    actor_identity=voter,
-                    tool_func=cast_ballot_tool,
-                    tool_name="cast_ballot",
-                    schema_class=VoteDecision,
-                    prompt=prompt,
-                )
+        if self.settings.llm_enabled:
+            vote_results = await self._collect_votes_concurrent(task, team, candidates)
+            for voter_id, decision in vote_results:
                 choice = decision.choice
                 if choice not in candidates:
                     raise GovernanceToolError(f"Vote choice '{choice}' is not a valid candidate: {candidates}")
                 votes.append(choice)
+                voter = self.agents[voter_id]
                 self._emit(task.id, "vote_cast", f"{voter.name} voted for {self.agents[choice].name}.", actor=voter_id, payload={"choice": choice, "reason": decision.reason, "confidence": decision.confidence})
                 self._record_position(
                     task.id,
@@ -3040,9 +3211,15 @@ class SocietyOrchestrator:
                         confidence=decision.confidence,
                     ),
                 )
-                continue
-
-            if not self.settings.llm_enabled:
+                if self.settings.native_voting_enabled:
+                    self._emit_tool_call(task.id, "cast_ballot", voter_id, f"candidates={','.join(candidates)}", decision.model_dump(), "native_agno", True)
+                else:
+                    ballots = self._state(task.id).setdefault("ballots", [])
+                    if not any(ballot.get("voter") == voter_id for ballot in ballots):
+                        ballots.append({"voter": voter_id, "choice": choice, "reason": decision.reason, "confidence": decision.confidence})
+                    self._emit_tool_call(task.id, "cast_vote", voter_id, f"candidates={','.join(candidates)}", decision.model_dump(), "native_agno", True)
+        else:
+            for voter_id in team.member_ids:
                 proposal_texts = "".join(proposals[c] for c in candidates)
                 seed = hash((task.prompt, voter_id, proposal_texts))
                 choice = candidates[seed % len(candidates)]
@@ -3072,58 +3249,6 @@ class SocietyOrchestrator:
                         confidence=1.0,
                     ),
                 )
-                continue
-
-            summary = "\n".join(f"- {cid}: {self.agents[cid].name}, role={self.agents[cid].role}" for cid in candidates)
-            voter = self.agents[voter_id]
-            self._state(task.id)["current_actor"] = voter_id
-            prompt = (
-                f"Task: {task.prompt}\n"
-                f"Candidates:\n{summary}\n"
-                f"Vote for the best proposal. The choice must be one of: {', '.join(candidates)}.\n"
-                f"Call the cast_vote tool with your decision."
-            )
-
-            decision = await self._run_governance_tool(
-                task=task,
-                actor_identity=voter,
-                tool_func=cast_vote_tool,
-                tool_name="cast_vote",
-                schema_class=VoteDecision,
-                prompt=prompt,
-            )
-
-            choice = decision.choice
-            if choice not in candidates:
-                raise GovernanceToolError(f"Vote choice '{choice}' is not a valid candidate: {candidates}")
-
-            votes.append(choice)
-            ballots = self._state(task.id).setdefault("ballots", [])
-            if not any(ballot.get("voter") == voter_id for ballot in ballots):
-                ballots.append({"voter": voter_id, "choice": choice, "reason": decision.reason, "confidence": decision.confidence})
-            self._emit(task.id, "vote_cast", f"{voter.name} voted for {self.agents[choice].name}.", actor=voter_id, payload={"choice": choice, "reason": decision.reason, "confidence": decision.confidence})
-            self._record_position(
-                task.id,
-                AgentPosition(
-                    agent_id=voter_id,
-                    phase="vote",
-                    stance="support",
-                    target=choice,
-                    reason=decision.reason,
-                    confidence=decision.confidence,
-                ),
-            )
-            self._record_collaboration_action(
-                task.id,
-                CollaborationAction(
-                    agent_id=voter_id,
-                    action="coalition_joined",
-                    target_agent_id=choice,
-                    phase="vote",
-                    reason=decision.reason,
-                    confidence=decision.confidence,
-                ),
-            )
 
         state = self._state(task.id)
         if self.settings.llm_enabled and self.settings.native_voting_enabled:
@@ -3133,7 +3258,7 @@ class SocietyOrchestrator:
                 tool_func=tally_ballots_tool,
                 tool_name="tally_ballots",
                 schema_class=TallyResult,
-                prompt="Tally all ballots and determine the winner. Call the tally_ballots tool.",
+                prompt="Tally all ballot and determine the winner. Call the tally_ballots tool.",
             )
             tally = state["tally"]
             winner = state["winner_id"]
