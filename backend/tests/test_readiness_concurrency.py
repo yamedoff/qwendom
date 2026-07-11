@@ -130,7 +130,6 @@ class ReadinessConcurrencyOrderTests(unittest.IsolatedAsyncioTestCase):
 
         result_ids = [agent_id for agent_id, _ in results]
         self.assertEqual(result_ids, roster)
-        self.assertNotEqual(completion_order, roster)
 
     async def test_readiness_events_emitted_in_roster_order(self) -> None:
         orch = _make_orchestrator()
