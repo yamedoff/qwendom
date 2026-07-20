@@ -13,6 +13,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import Settings
+from society.capability_registry import resolve_specialist_bundle
 from society.composition_runtime import (
     AGENTBAY_RUNTIME_TOOL_IDS,
     IMAGE_RUNTIME_TOOL_IDS,
@@ -1153,6 +1154,76 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(result.node_outputs["builder-node"]["artifact_refs"], ["agentbay/exported_calc.py"])
             self.assertEqual(result.node_artifact_refs["builder-node"], ["agentbay/exported_calc.py"])
+
+    async def test_verified_generated_image_satisfies_image_artifact_contract(self) -> None:
+        """A persisted image is valid evidence without an AgentBay workspace export."""
+
+        artifact_id = "artifact_" + ("a" * 32)
+
+        class FakeMediaStore:
+            def __init__(self, _root: Path) -> None:
+                pass
+
+            def load_artifact_manifest(self, value: str) -> dict[str, Any]:
+                if value != artifact_id:
+                    raise AssertionError(f"Unexpected media artifact ID: {value}")
+                return {"artifact_id": value, "kind": "image", "provenance_complete": True}
+
+        class FakeImageToolkit:
+            def __init__(self, *, event_sink: Any, **kwargs: Any) -> None:
+                del kwargs
+                self._event_sink = event_sink
+
+            def generate_images(self) -> dict[str, Any]:
+                result = {"success": True, "data": {"artifact_ids": [artifact_id]}}
+                self._event_sink(result)
+                return result
+
+            def inspect_image(self) -> None:
+                return None
+
+            def publish_image(self) -> None:
+                return None
+
+        class FakeAgent:
+            def __init__(self, tools: list[Any]) -> None:
+                self._tools = {getattr(tool, "__name__", type(tool).__name__): tool for tool in tools}
+
+            async def arun(self, prompt: str) -> dict[str, Any]:
+                del prompt
+                self._tools["generate_images"]()
+                return {"summary": "Generated the visual."}
+
+        with TemporaryDirectory() as temp_dir:
+            assignment = _assignment(
+                "image",
+                "image_creator",
+                required_capabilities=["image_generation"],
+                tool_ids=["generate_images", "inspect_image", "publish_image"],
+            )
+            bundle = resolve_specialist_bundle("image_creator")
+            assignment.template_version = bundle.template.version
+            assignment.tool_bundle_hash = bundle.tool_bundle_hash
+            assignment.resolved_skills = bundle.skills
+            assignment.expected_artifacts = ["launch_visual_16x9.png"]
+            runtime = CompositionRuntime(
+                _settings(),
+                temp_dir,
+                preflight_fn=_preflight(agentbay=False),
+                build_agent_factory=lambda identity, settings, **kwargs: FakeAgent(kwargs["tools"]),
+                image_toolkit_factory=FakeImageToolkit,
+                media_store_factory=FakeMediaStore,
+            )
+
+            result = await runtime.execute_plan(
+                _plan([assignment], [WorkNode(id="image-node", assignment_id="image")]),
+                "task",
+                "request",
+            )
+
+            output = result.node_outputs["image-node"]
+            self.assertEqual(output["artifact_refs"], [artifact_id])
+            self.assertEqual(output["media_artifacts"], [{"expected_artifact": "launch_visual_16x9.png", "artifact_id": artifact_id, "kind": "image"}])
 
     async def test_event_backed_negative_validation_fails_when_model_omits_fields(self) -> None:
         with TemporaryDirectory() as temp_dir:

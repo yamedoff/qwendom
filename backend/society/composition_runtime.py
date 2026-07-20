@@ -421,6 +421,31 @@ def _event_backed_artifact_refs(
     return _merge_unique_strings(refs, limit=_MAX_OUTPUT_ITEMS)
 
 
+def _event_backed_media_artifact_ids(
+    internal_trace: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Return media IDs reported by a successful generation-tool invocation.
+
+    Media generation persists bytes in ``MediaArtifactStore`` rather than an
+    AgentBay workspace.  Its result is emitted through the same bounded tool
+    trace used for AgentBay evidence, so retain only IDs from successful calls;
+    callers must still resolve each ID through the store before trusting it.
+    """
+
+    artifact_ids: list[str] = []
+    for event_type, payload in _tool_trace_entries(internal_trace):
+        if event_type != "composition_tool_event" or payload.get("success") is not True:
+            continue
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            continue
+        reported_ids = data.get("artifact_ids")
+        if not isinstance(reported_ids, list):
+            continue
+        artifact_ids.extend(item for item in reported_ids if isinstance(item, str) and item.strip())
+    return _merge_unique_strings(artifact_ids, limit=_MAX_OUTPUT_ITEMS)
+
+
 def _merge_event_backed_output(
     assignment: TeamAssignment,
     result: Mapping[str, Any],
@@ -555,6 +580,24 @@ class AgnoAssignmentExecutor:
                     pass
 
         return emit
+
+    def _verified_generated_media_artifacts(
+        self,
+        internal_trace: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Resolve generated-media trace IDs to durable, provenance-complete manifests."""
+
+        verified: list[dict[str, Any]] = []
+        for artifact_id in _event_backed_media_artifact_ids(internal_trace):
+            try:
+                manifest = self._media_store.load_artifact_manifest(artifact_id)
+            except Exception:
+                continue
+            kind = manifest.get("kind")
+            if kind not in {"image", "video"} or manifest.get("provenance_complete") is not True:
+                continue
+            verified.append({"artifact_id": artifact_id, "kind": kind})
+        return verified
 
     @staticmethod
     def _missing_required_tool_evidence(
@@ -1050,6 +1093,7 @@ class AgnoAssignmentExecutor:
                     settings=self._settings,
                     artifact_store=self._media_store,
                     http_client=media_client,
+                    event_sink=toolkit_event_sink,
                 )
                 for tool_id in granted_tool_ids:
                     if tool_id in IMAGE_RUNTIME_TOOL_IDS and hasattr(image_toolkit, tool_id):
@@ -1062,6 +1106,7 @@ class AgnoAssignmentExecutor:
                     settings=self._settings,
                     artifact_store=self._media_store,
                     http_client=media_client,
+                    event_sink=toolkit_event_sink,
                 )
                 for tool_id in granted_tool_ids:
                     if tool_id in VIDEO_RUNTIME_TOOL_IDS and hasattr(video_toolkit, tool_id):
@@ -1203,6 +1248,30 @@ class AgnoAssignmentExecutor:
                     f"Mandatory tool evidence missing: {sorted(set(missing_required))}",
                 )
             merged_result = _merge_event_backed_output(assignment, result, internal_tool_trace)
+            verified_media_artifacts = self._verified_generated_media_artifacts(internal_tool_trace)
+            media_artifacts_by_expected_path: dict[str, dict[str, Any]] = {}
+            for expected_path, media_artifact in zip(
+                (
+                    path
+                    for path in assignment.expected_artifacts
+                    if Path(str(path)).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm"}
+                ),
+                verified_media_artifacts,
+                strict=False,
+            ):
+                media_artifacts_by_expected_path[str(expected_path)] = media_artifact
+            if media_artifacts_by_expected_path:
+                # Preserve the produced-media reference for projections while
+                # keeping workspace_exports exclusively for AgentBay files.
+                merged_result["media_artifacts"] = [
+                    {"expected_artifact": path, **artifact}
+                    for path, artifact in media_artifacts_by_expected_path.items()
+                ]
+                merged_result["artifact_refs"] = _merge_unique_strings(
+                    merged_result.get("artifact_refs") if isinstance(merged_result.get("artifact_refs"), list) else [],
+                    [artifact["artifact_id"] for artifact in media_artifacts_by_expected_path.values()],
+                    limit=_MAX_OUTPUT_ITEMS,
+                )
             if assignment.agent_template_id == "test_engineer" and merged_result.get("passed") is not True:
                 failures = merged_result.get("failures")
                 failure_summary = failures if isinstance(failures, list) else []
@@ -1223,7 +1292,10 @@ class AgnoAssignmentExecutor:
                 missing_artifacts = sorted(
                     str(path).replace("\\", "/").removeprefix("/workspace/").lstrip("/")
                     for path in assignment.expected_artifacts
-                    if str(path).replace("\\", "/").removeprefix("/workspace/").lstrip("/") not in exported_paths
+                    if (
+                        str(path).replace("\\", "/").removeprefix("/workspace/").lstrip("/") not in exported_paths
+                        and str(path) not in media_artifacts_by_expected_path
+                    )
                 )
                 if missing_artifacts:
                     raise NodeExecutionError(
