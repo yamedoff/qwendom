@@ -45,6 +45,8 @@ The direct requirements and their audited installed licenses were:
 | `pydantic` | 2.12.5 | MIT |
 | `pydantic-settings` | 2.13.1 | MIT |
 | `python-dotenv` | 1.2.1 | BSD-3-Clause |
+| `wuying-agentbay-sdk` | 0.22.3 | Apache-2.0 |
+| `httpx` | 0.28.1 | BSD-3-Clause |
 
 The installed transitive closure reported only Apache-2.0, BSD-2-Clause,
 BSD-3-Clause, ISC, MIT, MIT-or-Apache-2.0, MPL-2.0, PSF, and PSF-2.0 license
@@ -69,13 +71,10 @@ and redistribution license here.
 ## Hackathon-period provenance
 
 The current Git history begins on 2026-07-11, after the hackathon cutoff date
-of 2026-05-26. Every commit visible in this repository is therefore
-hackathon-period work. The uncommitted readiness work adds the benchmark,
-typed blockers, capability registry, retry/error taxonomy, acceptance evidence,
-direct-Qwen hardening, runtime durability, browser truth fixes, and submission
-documentation. If this repository was copied from earlier private work, the
-current Git history cannot independently prove that earlier provenance; the
-team representative must disclose any such pre-existing source before submission.
+of 2026-05-26. Every published commit in this repository is therefore
+hackathon-period work. If this repository was copied from earlier private work,
+the public history cannot independently prove that earlier provenance; the
+team representative must disclose any pre-existing source before submission.
 
 ## Final public-release checks
 

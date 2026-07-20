@@ -1,598 +1,179 @@
-# Qwendom Society Runtime
+# Qwendom society runtime
 
-This document describes the current V3 Qwendom Agent Society implementation:
-what exists, how a task runs, which agents and tools participate, and which
-collaboration patterns the system demonstrates.
+This document describes the current production path: Qwen-backed governance, fixed specialist composition, AgentBay execution, independent validation, and event-sourced review surfaces.
 
-## System Shape
+## Runtime shape
 
-Qwendom is a FastAPI + React application backed by Agno agents, teams, tools,
-workflow checkpoints, local JSONL events, and an Agno SQLite database.
-
-Main runtime modules:
-
-| Area | File | Responsibility |
+| Layer | Main modules | Responsibility |
 |---|---|---|
-| API | `backend/main.py` | FastAPI routes, SSE task stream, metrics endpoint |
-| Orchestration | `backend/society/orchestrator.py` | End-to-end society lifecycle and event emission |
-| Agent factory | `backend/society/agents.py` | Builds Agno `Agent` instances with model, memory, knowledge, and tools |
-| Team factory | `backend/society/team.py` | Builds the Agno `Team` using `TeamMode.coordinate` |
-| Workflow | `backend/society/workflow.py` | Defines the six governance checkpoints and task metrics computation |
-| Session state | `backend/society/session.py` | Defines the shared JSON-serializable governance ledger |
-| Events and memory replay | `backend/society/memory.py` | Append-only JSONL event store and memory reconstruction |
-| Reputation | `backend/society/reputation.py` | Multi-dimensional reputation scores and replayable snapshots |
-| Knowledge | `backend/society/knowledge/loaders.py` | Role-scoped filesystem knowledge loader |
-| Agno DB | `backend/society/db.py` | Agno SQLite or configured DB factory |
-| Schemas | `backend/society/schemas/*.py` | Pydantic contracts for tool outputs and metrics |
-| Tools | `backend/society/tools/*.py` | Agno `@tool` functions used by agents or available to V3 workflows |
+| API and streaming | `backend/main.py` | Task submission, clarification, SSE, projections, verified artifact downloads, health |
+| Society lifecycle | `backend/society/orchestrator.py` | Team formation, readiness, leadership, debate, composition, validation, terminal state |
+| Fixed specialist policy | `backend/society/capability_registry.py` | Immutable templates, tool grants, skill hashes, resource and artifact contracts |
+| Execution graph | `backend/society/composition_runtime.py` | Dependency-aware specialist scheduling, AgentBay/media execution, retries, blockers |
+| Qwen agents | `backend/society/agents.py`, `team.py` | Agno agents and coordinated Qwen turns |
+| AgentBay tools | `backend/society/tools/agentbay.py` | Task-scoped code and browser environments, commands, files, renders, exports, cleanup |
+| Media tools | `backend/society/tools/image_generation.py`, `video_generation.py`, `media_store.py` | Qwen image and Wan video submission, collection, inspection, publication |
+| Evidence and replay | `backend/society/memory.py`, `projections.py` | Append-only events and Live/Review/Recap/Dossier projections |
+| Artifact delivery | `backend/main.py` | Task ownership, SHA-256 verification, download and view endpoints |
 
-## Runtime Configuration
+## The two-layer team
 
-Configuration is loaded from `backend/.env` through `backend/config.py`.
+### Core society
 
-Important settings:
+Four persistent agents govern every mission:
 
-| Setting | Default | Meaning |
-|---|---|---|
-| `LLM_PROVIDER` | `qwen` | Must be `qwen` |
-| `QWEN_API_KEY` | empty | Enables Qwen/DashScope-backed agents |
-| `QWEN_BASE_URL` | DashScope compatible endpoint | Qwen Cloud endpoint |
-| `QWEN_MODEL` | `qwen3.7-plus` | Qwen submission model id |
-| `LLM_TIMEOUT_SECONDS` | `60` | Timeout for individual model-backed tool calls |
-| `ALLOW_DETERMINISTIC_NO_KEY` | `false` | Explicitly enables local fallback tasks without a model credential |
-| `FRONTEND_ORIGIN` | `http://localhost:5173` | CORS origin for the React app |
-| `KNOWLEDGE_DIR` | `backend/society/knowledge/data` | Role knowledge root |
-| `AGNO_SQLITE_FILE` | `backend/society/data/agno.sqlite` | Local Agno DB file |
-| `AGNO_DB_URL` | empty | Optional DB URL override |
-| `AGENT_PROFILES_ENABLED` | `true` | Injects stable work-behavior profiles into agent prompts |
-| `SOCIAL_TOOLS_ENABLED` | `true` | Records typed stance, objection, endorsement, and trust artifacts |
-| `SOCIAL_TRACE_ENABLED` | `true` | Emits social artifacts as user-visible timeline events |
-| `CONTEXTUAL_TRUST_ENABLED` | `true` | Blends task-class trust into leadership scoring |
-| `ROLE_SPECIFIC_TOOLS_ENABLED` | `true` | Gives each role a distinct primary tool and social support-tool bundle |
+| ID | Name | Role | Primary responsibility |
+|---|---|---|---|
+| `architect` | Ada | Systems Architect | scope, decomposition, interfaces, ownership |
+| `researcher` | Ibn | Research Analyst | evidence, uncertainty, current technical context |
+| `builder` | Lin | Builder | implementation feasibility and work planning |
+| `critic` | Noor | Adversarial Reviewer | counterarguments, blockers, and acceptance risk |
 
-Without an API key, task submission fails honestly by default. Deterministic
-no-key mode remains available only when `ALLOW_DETERMINISTIC_NO_KEY=true` is
-explicitly set for local development or tests. Never present that mode as Qwen
-submission evidence.
+These roles participate in readiness, leadership, debate, and voting. Their contributions remain linked in the event ledger rather than being flattened into parallel answers.
 
-## Agents
+### Fixed execution specialists
 
-The persistent society starts with four agents. Each agent has a stable
-work-behavior profile in addition to its role and skills. Profiles are exposed
-through `GET /agents` and injected into Agno instructions so agents make
-different collaboration moves instead of merely using different names.
+The elected leader selects from a repository-owned catalog after readiness. These employees do not automatically join the voting roster.
 
-| ID | Name | Role | Work behavior | Primary capability tool |
+| Template | Role | Pinned skill | Production rights | Validation rights |
 |---|---|---|---|---|
-| `architect` | Ada | Systems Architect | Structured, scope-aware, values boundaries and maintainability, blocks vague ownership or incoherent architecture, defers to Lin on implementation cost | `decompose_task` |
-| `researcher` | Ibn | Research Analyst | Careful, evidence-driven, labels uncertainty, blocks unsupported claims, defers to Ada on system shape | `memory_lookup` |
-| `builder` | Lin | Implementation Engineer | Direct, delivery-focused, values small shippable slices and validation commands, defers to Noor on quality gates | `implementation_plan` |
-| `critic` | Noor | Adversarial Reviewer | Concise, skeptical, values correctness and bounded risk, blocks missing validation, defers to Ibn on evidence quality | `risk_assessment` |
+| `builder@2` | Implementation Engineer | `repository_implementation@2` | repository changes and exported artifacts in AgentBay | cannot validate own output |
+| `test_engineer@1` | Test Engineer | `independent_validation@1` | no product-file changes | independently inspects and validates exports |
+| `image_creator@1` | Image Creator | `image_generation@1` | generated and published image artifacts | cannot accept own output |
+| `frontend_engineer@2` | Frontend Engineer | `frontend_browser_delivery@1` | bounded UI, browser evidence, and exports in AgentBay | cannot validate own output |
 
-Profile fields include values, communication style, risk tolerance, decision
-bias, default blockers, deferral preferences, and the agent's known failure
-mode. When `AGENT_PROFILES_ENABLED=true`, the instruction layer tells agents not
-to agree for politeness and to support, challenge, defer, or block based on
-their profile and task evidence. Deterministic fallback contributions also use
-profile style, bias, and blockers so local demos still show distinct behavior.
+Every template freezes its capabilities, exact tool IDs, required tools, resource limits, conflict domains, and artifact contract. Every skill reference includes a version and SHA-256. `resolve_specialist_bundle()` verifies the content and derives a tool-bundle hash before the invocation can proceed.
 
-The leader can spawn a temporary child specialist. The child role comes from
-the spawn decision tool when LLM mode is enabled, or from the deterministic long
-prompt fallback. The child receives derived skills such as focused delegation,
-status reporting, evidence gathering, risk analysis, implementation planning,
-or scope reduction depending on the requested specialist role. Temporary child
-specialists also receive role-derived work-behavior profiles so complex tasks do
-not degrade into generic agent behavior.
+## Tool boundaries
 
-Child agents join the task team and can propose, vote, learn, and then dissolve
-with the temporary team.
+### Implementation Engineer
 
-## Task Lifecycle
+Granted tools:
 
-Submitting `POST /tasks` creates a `TaskRun`, emits `task_received`, and starts
-`SocietyOrchestrator.run_task()`.
+`start_execution_environment`, `execute_command`, `run_code`, `read_text_file`, `write_text_file`, `list_files`, `export_artifact`, `close_execution_environment`
 
-Current lifecycle:
+The skill requires inspection before editing, read-back after writing, a successful supported check, explicit export, and truthful blocker reporting. It cannot supply independent acceptance evidence for its own work.
 
-1. **Form team**
-   - Creates a task-scoped `Team` domain record.
-   - Seeds `session_state` with prompt, roster, proposals, ballots, metrics,
-     reputation snapshot, and child-agent slots.
-   - Builds an Agno `Workflow`.
-   - Builds an Agno `Team` in LLM mode.
+### Test Engineer
 
-2. **Run Workflow checkpoints**
-   - Executes a six-step Agno `Workflow`.
-   - Each step writes a checkpoint into shared session state.
-   - The orchestrator emits `workflow_checkpoint` events plus
-     `workflow_completed`.
+Granted tools:
 
-3. **Run Agno Team coordination**
-   - In LLM mode, the Agno Team runs one bounded coordination pass.
-   - The app emits `agno_team_ran` with a concise coordination brief.
-   - In deterministic mode this step is skipped.
+`start_execution_environment`, `execute_command`, `run_code`, `read_text_file`, `list_files`, `inspect_artifact`, `report_independent_validation`, `close_execution_environment`
 
-4. **Elect leader**
-   - LLM mode calls `elect_leader`.
-   - Deterministic mode uses reputation and skill count.
-   - Session state records `leader_id`.
-   - Event: `leader_elected`.
+The validator works from exported artifacts and explicit dependency evidence. It verifies paths and hashes, runs acceptance and adversarial checks, fails closed on missing evidence, and never edits product files.
 
-5. **Decide child-agent spawn**
-   - LLM mode calls `decide_spawn`.
-   - Deterministic mode spawns only for longer prompts.
-   - If spawning, `_do_spawn()` creates a child with role-derived skills.
-   - Events: `no_spawn` or `child_agent_spawned`.
+### Image Creator
 
-6. **Negotiate proposals**
-   - Each member uses their role capability tool.
-   - In LLM mode, the structured tool result becomes that member's proposal.
-   - In deterministic mode, local fallback text becomes the proposal.
-   - Event per member: `agent_negotiated`.
+Granted tools:
 
-7. **Challenge and revise**
-   - The critic challenges one target proposal.
-   - The target proposal is revised before voting.
-   - Session state records `challenges` and `revisions`.
-   - Events: `proposal_challenged`, `proposal_revised`,
-     `debate_round_completed`, `negotiation_closed`.
+`generate_images`, `inspect_image`, `publish_image`
 
-8. **Vote**
-   - LLM mode calls `cast_vote` for each team member.
-   - Deterministic mode uses a stable hash fallback.
-   - Session state records ballots, tally, and winner.
-   - Events: `vote_cast`, `ballots_tallied`, `solution_selected`.
+The skill creates a durable provider artifact, inspects its stored manifest, and publishes it with model provenance. Placeholder files, stock downloads, and unrecorded external assets are outside the contract.
 
-9. **Monitor**
-   - The critic reviews the winning candidate.
-   - LLM mode calls `peer_review`.
-   - Deterministic mode emits a simple fallback critique.
-   - Event: `peer_monitor_report`.
+### Frontend Engineer
 
-10. **Learn and update reputation**
-    - Each member records a memory event.
-    - Multi-dimensional reputation scores update.
-    - A reputation snapshot is emitted for replay after restart.
-    - Events: `tool_call` for `memory_write`, `reputation_updated`,
-      `learning_recorded`.
+Granted tools:
 
-11. **Dissolve and complete**
-    - Child agents are removed from the live pool.
-    - Metrics are computed from session state.
-    - Final answer is composed from leader and winning proposal.
-    - Events: `team_dissolved`, `task_metrics`, `task_complete`.
+AgentBay environment, command, code, file, `browser_render`, export, and cleanup tools.
 
-## Workflow Checkpoints
+The skill writes a renderable build, confirms the output path, captures browser and console evidence, exports the owned artifacts, and closes the environment. Browser evidence still requires a separate Test Engineer verdict.
 
-`backend/society/workflow.py` defines these checkpoints:
+### Research and media
 
-1. `form_and_elect`
-2. `spawn_or_delegate`
-3. `debate`
-4. `vote`
-5. `monitor`
-6. `learn_and_measure`
+The Researcher may use the allowlisted Context7 MCP path when current technical evidence is necessary. Qwendom records the lookup objective, query, returned evidence, provenance, and failures.
 
-The checkpoints are Agno `Step` objects. They are intentionally small: the
-workflow records phase progression, while the orchestrator maps each phase into
-domain events, tool calls, and UI-visible timeline entries.
+Image execution uses Qwen Image through the configured DashScope/Model Studio endpoint. The runtime also contains Wan Video submission, status, collection, and inspection tools. Provider operations are recorded as tool evidence; the production fixed catalog currently assigns image generation to the Image Creator template.
 
-## Shared Session State
+## Mission lifecycle
 
-`initial_session_state()` creates the task ledger:
+1. **Intake** — `POST /tasks` creates a task and emits `task_received`.
+2. **Team formation** — the four core roles enter a task-scoped team and publish a working brief.
+3. **Goal discussion and readiness** — roles reply to the mission, identify missing information, and cast typed readiness ballots.
+4. **Pause when necessary** — user-input, system-capability, and safety blockers can pause the run. `POST /tasks/{task_id}/clarifications` resumes from the persisted phase.
+5. **Leadership** — the society elects a task-specific leader.
+6. **Composition** — the leader selects fixed templates and produces a dependency-aware work graph. Unknown templates, unavailable required tools, and invalid bundles fail closed.
+7. **Execution** — specialists run only when dependencies and resource limits allow. AgentBay, media, and research calls emit typed results and failures.
+8. **Debate and selection** — proposals, direct replies, counterproposals, revisions, ballots, and the selected approach remain linked in the ledger.
+9. **Independent validation** — exported artifacts and acceptance evidence are checked by a role separate from the producer.
+10. **Terminal gate** — the runtime derives `complete`, `complete_with_warnings`, remediation, interruption, or failure from evidence. Prose cannot override the gate.
 
-```json
-{
-  "task_prompt": "...",
-  "roster": [],
-  "phase": "forming",
-  "leader_id": null,
-  "proposals": {},
-  "challenges": [],
-  "revisions": {},
-  "ballots": [],
-  "tally": {},
-  "winner_id": null,
-  "critique": null,
-  "spawn_decision": null,
-  "child_agents": [],
-  "subtasks": [],
-  "evaluation_metrics": [],
-  "reputations": {},
-  "metrics": {
-    "tool_calls": 0,
-    "tool_calls_failed": 0,
-    "governance_rounds": 0,
-    "debate_rounds": 0,
-    "memory_writes": 0
-  }
-}
-```
+## AgentBay lifecycle
 
-The orchestrator passes this state into Agno Agent and Team calls. Tools can
-write into `run_context.session_state`, and the orchestrator also writes the
-authoritative event-mapped fields so deterministic and LLM runs behave
-consistently.
+AgentBay is the execution boundary for code, tests, and browser work:
 
-## Tools
+1. start a task-scoped code or browser environment;
+2. stage approved inputs;
+3. expose only the resolved specialist tools;
+4. execute bounded commands, code, file, or browser operations;
+5. export explicit artifacts;
+6. retrieve bytes and record provenance plus SHA-256;
+7. close the environment; and
+8. preserve cleanup failure as a blocker.
 
-Tools are Agno `@tool` functions. They return validated JSON and, when Agno
-provides a `RunContext`, also update shared session state.
+The host repository is not the Builder's workspace. A file inside AgentBay is not a public artifact until it is exported, retrieved, hashed, attached to the task, and independently validated.
 
-### Governance Tools
+## Evidence model
 
-File: `backend/society/tools/governance.py`
+The append-only event store is the source of truth for:
 
-| Tool | Used by | Purpose | Output schema |
-|---|---|---|---|
-| `elect_leader` | election | Chooses the task leader from team member ids | `LeaderDecision` |
-| `decide_spawn` | spawn decision | Decides whether a child specialist is needed and names the specialist role | `SpawnDecision` |
-| `cast_vote` | voting | Casts a vote for a candidate proposal | `VoteDecision` |
-| `peer_review` | monitoring | Reviews the winning candidate for assumptions, risks, and improvements | `CritiqueReport` |
+- conversation turns and direct replies;
+- readiness ballots and typed blockers;
+- leader and specialist selection;
+- work-graph dependencies and ownership;
+- tool intent, results, retries, and failures;
+- AgentBay session lifecycle and cleanup;
+- artifact exports, provenance, and hashes;
+- independent validation; and
+- final acceptance status.
 
-The list fields in `peer_review` tolerate either real JSON arrays or newline
-bullet strings because some providers send list-shaped arguments as text.
+React consumes stable projections of these events. Live, Review, Recap, Artifacts, and Dossier are different views of the same history.
 
-### Capability Tools
+## Configuration
 
-File: `backend/society/tools/capabilities.py`
+The production path uses `backend/.env`:
 
-| Tool | Agent | Purpose | Output schema |
-|---|---|---|---|
-| `decompose_task` | Ada / architect | Clarifies the objective, ordered steps, and delegation plan | `TaskDecomposition` |
-| `memory_lookup` | Ibn / researcher | Retrieves relevant memories and a lesson to apply | `MemoryLookup` |
-| `implementation_plan` | Lin / builder and fallback child specialists | Plans artifact, milestones, and acceptance checks | `ImplementationPlan` |
-| `risk_assessment` | Noor / critic | Captures risks, mitigations, and a quality gate | `RiskAssessment` |
-| `memory_write` | all agents | Records a durable lesson or collaboration fact | `MemoryWrite` |
-
-Like governance tools, list fields tolerate both JSON arrays and bullet strings.
-
-### Debate Tools
-
-File: `backend/society/tools/debate.py`
-
-| Tool | Purpose |
+| Setting | Purpose |
 |---|---|
-| `propose` | Writes an agent proposal into `session_state["proposals"]` |
-| `challenge` | Writes a challenge into `session_state["challenges"]` |
-| `revise` | Writes a revision into `session_state["revisions"]` |
+| `QWEN_API_KEY`, `QWEN_BASE_URL`, `QWEN_MODEL` | Qwen Cloud reasoning |
+| `AGENTBAY_API_KEY`, `AGENTBAY_ENDPOINT`, `AGENTBAY_REGION_ID` | isolated execution |
+| `AGENTBAY_IMAGE_ID`, `AGENTBAY_BROWSER_IMAGE_ID` | code and browser sandbox images |
+| `TEAM_COMPOSITION_EXECUTION_ENABLED=true` | fixed specialist execution |
+| `SOCIETY_MAX_MODEL_WORKERS` | concurrent model work |
+| `SOCIETY_MAX_AGENTBAY_SESSIONS` | concurrent AgentBay environments |
+| `SOCIETY_MAX_MEDIA_JOBS` | concurrent media jobs |
+| `CONTEXT7_MCP_ENABLED`, `CONTEXT7_MCP_COMMAND` | technical research path |
+| `QWEN_IMAGE_MODEL`, `WAN_VIDEO_MODEL` | media model IDs |
+| `ALLOW_DETERMINISTIC_NO_KEY=false` | fail honestly without credentials |
 
-These are available as V3 RunContext-native primitives. The current
-orchestrator implements the active challenge/revision cycle directly so it can
-emit stable timeline events and preserve deterministic parity.
+Deterministic no-key mode exists for labelled lifecycle tests only. It is not provider, sandbox, or benchmark evidence.
 
-### Voting Tools
-
-File: `backend/society/tools/voting.py`
-
-| Tool | Purpose |
-|---|---|
-| `cast_ballot` | Records a ballot in shared session state |
-| `tally_ballots` | Tallies ballots and writes the winner |
-
-These are reusable V3 primitives. The active runtime currently uses
-`governance.cast_vote` because it matches the existing `VoteDecision`
-extraction path and UI event payloads.
-
-### Delegation Tools
-
-File: `backend/society/tools/delegation.py`
-
-| Tool | Purpose |
-|---|---|
-| `assign_subtask` | Adds an assigned subtask to session state |
-| `report_subtask` | Marks a subtask completed and stores blockers |
-
-These support future child-agent delegation workflows. The current runtime
-spawns child agents and includes them in negotiation/voting, but does not yet
-drive a full subtask assignment/report loop from the UI.
-
-### Evaluation Tools
-
-File: `backend/society/tools/evaluation.py`
-
-| Tool | Purpose |
-|---|---|
-| `record_metric` | Appends an evaluation metric to `session_state["evaluation_metrics"]` |
-
-The current runtime also computes system metrics automatically at task end with
-`compute_task_metrics()`.
-
-## Collaboration Patterns
-
-### Temporary Task Society
-
-Every prompt creates a task-scoped team. The team exists only for the task and
-is dissolved afterward. This keeps collaboration state local to the task while
-persistent identities, memory, and reputation carry forward.
-
-### Social Trace
-
-The runtime records typed social artifacts alongside existing governance events:
-
-| Event | Meaning |
-|---|---|
-| `agent_position_stated` | An agent publicly supports, opposes, defers, blocks, or remains uncertain during a phase |
-| `agent_objection_registered` | An agent records a severity-tagged objection and its resolution condition |
-| `agent_endorsed_peer` | An agent defers to or endorses another agent for a domain |
-| `agent_changed_mind` | An agent revises a position after another agent's challenge or new evidence |
-| `private_note_published` | An agent chooses to share a private working note with the team |
-| `agent_tool_bundle_selected` | The runtime records the role-specific tool bundle selected for an agent |
-| `agent_help_requested` | An assigned agent asks another agent, usually the leader, to keep work unblocked |
-| `agent_deferred_ownership` | An agent explicitly lets another agent coordinate or own a decision |
-| `agent_joined_coalition` | An agent publicly backs another agent's proposal during selection |
-| `trust_updated` | The society records a contextual trust movement after collaboration |
-
-These events are a mix of tool-mediated stances, derived governance signals,
-and bounded outcome signals. They let the product show human-like work behavior
-without adding unbounded extra model calls. The frontend renders them in the
-workflow timeline as the first visible social trace layer.
-
-### Role-Specific Tools
-
-Agents now receive product-visible tool bundles instead of a single shared
-capability surface:
-
-| Role | Primary Tool | Support Tools |
-|---|---|---|
-| Architect | `decompose_task` | `state_position`, `endorse_agent`, `record_private_note` |
-| Researcher | `memory_lookup` | `record_private_note`, `publish_private_note`, `state_position` |
-| Builder | `implementation_plan` | `state_position`, `change_mind`, `record_private_note` |
-| Critic | `risk_assessment` | `register_objection`, `evaluate_peer`, `publish_private_note` |
-
-Spawned specialists are mapped by role and skills, so a temporary evidence
-specialist behaves like a researcher while a review specialist behaves like a
-critic. The timeline emits `agent_tool_bundle_selected` when negotiation uses a
-bundle, making capability differences inspectable in the product.
-
-### Group Dynamics
-
-The society also derives lightweight collaboration actions from existing
-workflow decisions:
-
-- leader election creates ownership deferrals from non-leaders to the elected
-  coordinator,
-- subtask assignment creates help requests from assignees back to the leader,
-- voting creates coalition signals around the proposals agents support.
-
-These actions are stored in `public_room.collaboration_actions` and rendered as
-timeline events. They make the society read less like isolated tool calls and
-more like a working group that asks for help, hands off authority, and forms
-temporary support around ideas.
-
-The frontend also renders a compact Society Behavior summary above the raw
-timeline. It aggregates objections, deferrals, help requests, mind changes,
-coalition joins, shared private notes, and trust movement, then shows the latest
-social moments as a scan-friendly digest. Raw events remain available below it
-for replay and debugging.
-
-After the working brief, each agent records a task-local private note. Notes stay
-private in `private_agent_state` unless the agent marks them publishable, in
-which case the runtime emits `private_note_published` and adds the note to the
-public room.
-
-Learning now stores compact social trace counts with each lesson, including
-positions, objections, endorsements, mind changes, private notes, published
-private notes, collaboration actions, and trust updates. This gives future runs a
-durable signal for persuasion, useful dissent, selective disclosure, and group
-dynamics instead of only remembering the final selected proposal.
-
-Learning also extracts per-agent social lessons from the typed trace:
-
-- agents that raise blockers remember the blocker and its resolution condition,
-- agents that change their mind remember what challenge changed their stance,
-- agents that persuaded a teammate remember to challenge with a concrete
-  revision path,
-- agents that ask for help, defer ownership, or join a coalition remember the
-  reusable behavioral rule for next time,
-- agents that receive trust or deferral remember the domain where teammates
-  relied on them.
-
-The memory panel parses these JSON lessons and shows the durable social rules
-separately from the raw trace counts.
-
-### Elected Leadership
-
-Leadership is task-specific. In LLM mode, the `elect_leader` tool selects the
-leader based on prompt, roster, skills, reputation scores, and contextual trust
-for the current task class. In deterministic mode, the highest contextual trust
-and skill-weighted score wins.
-
-When `CONTEXTUAL_TRUST_ENABLED=true`, leadership scoring blends global
-reputation with task-class-specific trust for `research`, `planning`,
-`implementation`, and `review` tasks. Scores are clamped, decay slightly toward
-baseline after each run, and are persisted inside the replayable reputation
-snapshot. Endorsements, task outcomes, validation signals, blockers, and role
-fit can move trust up or down.
-
-### Role-Specific Contribution
-
-Agents do not all answer the same way. Each persistent office has a primary
-capability tool:
-
-- architect decomposes
-- researcher recalls memory
-- builder plans implementation
-- critic assesses risk
-
-This creates structured disagreement and avoids a flat "four assistants say the
-same thing" pattern.
-
-### Challenge Before Vote
-
-Before voting, the critic challenges one proposal and the target proposal is
-revised. The system records both the challenge and revision. This gives the
-vote a concrete debate history instead of selecting from untested first drafts.
-
-### Voting and Monitoring
-
-Each member votes independently. The winning proposal is then reviewed by the
-critic. This separates selection from quality control.
-
-### Dynamic Child Agents
-
-The leader can spawn one child specialist when the task appears complex. In LLM
-mode, the child role comes from the `decide_spawn` tool. In deterministic mode,
-longer prompts spawn a scope-reduction specialist. The child participates in
-proposal and voting phases, then dissolves with the team.
-
-### Learning Loop
-
-At the end of every task:
-
-- each agent records a memory event
-- reputation and task-class trust scores update
-- reputation is persisted as a replayable event
-- task metrics are emitted
-
-This makes later tasks sensitive to past collaboration without requiring a
-production database.
-
-## Persistence
-
-There are two persistence layers:
-
-1. **JSONL event log**
-   - Path: `backend/society/data/events.jsonl`
-   - Stores timeline events, tool calls, memory-write events, task summaries,
-     metrics, and reputation snapshots.
-   - Powers replay in the UI and restart reconstruction.
-
-2. **Agno DB**
-   - Default path: `backend/society/data/agno.sqlite`
-   - Created by `backend/society/db.py`.
-   - Passed into Agno Agents and Workflows for native session/memory support.
-
-The `.gitignore` excludes `backend/society/data/`, so local run history and DB
-files stay out of source control.
-
-## Metrics
-
-Task metrics are computed at completion from session state:
-
-| Metric | Meaning |
-|---|---|
-| `total_duration_seconds` | End-to-end task duration |
-| `governance_rounds` | Leader-election/governance cycles |
-| `debate_rounds` | Debate rounds run before voting |
-| `tool_calls_total` | Count of emitted tool calls |
-| `tool_calls_failed` | Failed tool calls |
-| `proposals_count` | Number of proposals in session state |
-| `challenges_count` | Number of recorded challenges |
-| `revisions_count` | Number of recorded revisions |
-| `vote_margin` | Winning vote share |
-| `critique_risk_count` | Risks in critic review |
-| `child_agents_spawned` | Child specialists created |
-| `memory_writes` | Memory writes emitted |
-| `answer_length` | Final answer length |
-
-`GET /metrics` aggregates live metrics and replayed `task_metrics` events from
-the JSONL log.
-
-## API Surface
+## API surface
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | Provider, model, and LLM-enabled status |
-| `GET /agents` | Current live agent pool |
-| `GET /agents/{agent_id}/memory` | Agent memory from live state plus JSONL replay |
-| `GET /teams` | In-memory task teams |
-| `GET /metrics` | Aggregate task metrics |
-| `POST /tasks` | Submit a new task |
-| `GET /tasks` | List task summaries from memory and replay |
-| `GET /tasks/{task_id}` | Fetch one task summary |
-| `GET /tasks/{task_id}/events` | Fetch persisted task events |
-| `GET /tasks/{task_id}/stream` | SSE stream for live UI timeline |
+| `GET /health`, `/health/preflight` | provider and execution readiness |
+| `GET /agents` | core society roster |
+| `GET /agents/{agent_id}/dossier?task_id=...` | participant record |
+| `POST /tasks` | submit a mission |
+| `POST /tasks/{task_id}/clarifications` | resume a paused mission |
+| `GET /tasks/{task_id}` | task state |
+| `GET /tasks/{task_id}/events` | append-only history |
+| `GET /tasks/{task_id}/stream` | live SSE stream |
+| `GET /tasks/{task_id}/cockpit` | live projection |
+| `GET /tasks/{task_id}/review` | ownership and acceptance projection |
+| `GET /tasks/{task_id}/recap` | decision-path projection |
+| `GET /tasks/{task_id}/artifacts` | task-owned outputs |
+| `GET /tasks/{task_id}/artifacts/{artifact_id}` | verified artifact download |
 
-## UI Behavior
+## Validation commands
 
-The React control room submits tasks and listens to the SSE stream. It renders:
-
-- current provider/model readiness
-- task timeline events
-- tool call payloads
-- final solution
-- agent pool cards
-- replayed task summaries
-- per-agent memory
-
-The frontend intentionally consumes stable event names instead of inspecting raw
-Agno internals.
-
-## Behavior Preflight
-
-Run this local gate after changing society behavior:
-
-```bash
-python -m society.behavior_preflight
-```
-
-It verifies the product-level human-behavior contract without spending model
-tokens. The preflight exercises the typed trace recorders for positions,
-objections, endorsements, mind changes, published private notes, help requests,
-ownership deferrals, coalition joins, trust updates, and reusable social
-learning. It fails if required event names disappear, public-room counts drift,
-or the social lesson extractor stops producing behavior-specific lessons.
-
-## Deterministic Mode vs LLM Mode
-
-| Concern | Deterministic mode | LLM mode |
-|---|---|---|
-| Team coordination | Agno Team skipped | Agno Team bounded coordination pass |
-| Leader election | Reputation/skills heuristic | `elect_leader` tool |
-| Spawn decision | Prompt length heuristic | `decide_spawn` tool |
-| Role contribution | Local fallback contribution | Role capability tool result |
-| Challenge/revision | Local deterministic challenge | Structured state-level challenge/revision |
-| Voting | Hash fallback | `cast_vote` tool |
-| Review | Local fallback critique | `peer_review` tool |
-| Learning | Local memory-write events | Structured memory-write events |
-
-Both modes emit the same broad event lifecycle so the UI and replay paths stay
-stable.
-
-## Validation Commands
-
-Run these from the repo root unless noted:
+From the repository root:
 
 ```powershell
 python -m compileall backend
-cd backend; python -m society.preflight
-cd frontend; npm run build
+python -m pytest backend/tests/test_capability_registry.py backend/tests/test_composition_runtime.py -q
+cd frontend
+npm run build
 ```
 
-Useful live checks:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health
-Invoke-RestMethod http://127.0.0.1:8000/metrics
-```
-
-The latest validated live run completed through:
-
-- Agno Team coordination
-- six Workflow checkpoints
-- native tool calls
-- child-agent spawn
-- negotiation
-- challenge and revision
-- voting
-- peer review
-- learning and reputation update
-- task metrics
-- task completion
-
-## Current Boundaries
-
-The implementation is V3-complete for the hackathon demo surface, but these are
-the current boundaries:
-
-- Role knowledge is filesystem-backed and lazy; empty knowledge folders are
-  treated as no knowledge rather than errors.
-- Child agents inherit knowledge by role fallback when no exact specialist
-  folder exists.
-- Debate, voting, delegation, and evaluation tool modules include reusable
-  RunContext primitives; not all of them are the active orchestrator path yet.
-- JSONL and local SQLite are appropriate for local/demo persistence, not a
-  distributed production deployment.
-- The frontend shows event payloads and final output, but does not yet provide a
-  dedicated metrics dashboard.
+For a live provider run, also require a ready `/health/preflight`, visible AgentBay session closure, downloadable artifact hashes, and an independent validation event.
