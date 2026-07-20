@@ -6,21 +6,6 @@ The backend uses FastAPI and the Agno SDK. The frontend is a small React control
 
 For the detailed runtime model, agent tools, collaboration patterns, persistence
 layers, and validation flow, see [`docs/SOCIETY_RUNTIME.md`](docs/SOCIETY_RUNTIME.md).
-For the Agno-native capability roadmap focused on useful tool access, artifact
-generation, workflow routing, delegation, and validation, see
-[`docs/AGNO_NATIVE_CAPABILITIES.md`](docs/AGNO_NATIVE_CAPABILITIES.md).
-For the execution-ready implementation phases, file mappings, rollout guards,
-and validation matrix, see [`docs/AGNO_ACTIVATION_PLAN.md`](docs/AGNO_ACTIVATION_PLAN.md).
-For the planned conversation-first workflow where agents discuss the goal,
-vote on readiness, elect a leader, and then receive subtasks, see
-[`docs/PRE_EXECUTION_CONVERSATION_WORKFLOW.md`](docs/PRE_EXECUTION_CONVERSATION_WORKFLOW.md).
-For the product-led implementation plan to make Qwendom mimic human work
-behavior through stronger agent identities, dissent, trust, meeting formats,
-and role-specific tools, see
-[`docs/AGENT_UPGRADE_IMPLEMENTATION_PLAN.md`](docs/AGENT_UPGRADE_IMPLEMENTATION_PLAN.md).
-For the remaining gaps between structured work behavior and natural human
-conversation, see
-[`docs/REMAINING_HUMAN_BEHAVIOR_GAPS.md`](docs/REMAINING_HUMAN_BEHAVIOR_GAPS.md).
 
 ## Why it fits the challenge
 
@@ -136,15 +121,12 @@ flowchart LR
   BENCH --> ORCH
 ```
 
-![Qwendom live society view](.qa-screenshots/recapture-2026-07-05T04-05-25-849Z/live-full-wide.png)
-
 Submission packaging drafts are available in
 [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) and
 [`docs/DEVPOST_SUBMISSION.md`](docs/DEVPOST_SUBMISSION.md). External demo,
 video, team, and deployment fields remain explicitly pending.
 
-The strict requirement ledger and third-party inventory are in
-[`docs/READINESS_AUDIT.md`](docs/READINESS_AUDIT.md) and
+The third-party inventory is in
 [`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md).
 
 ## Reproducible benchmark
@@ -158,9 +140,8 @@ per mode, both scored **100.00**. Society used **53 calls / 810,389 tokens /
 the single agent. The honest result is equal quality while society is about
 19.9 times slower and uses about 97.5 times more tokens—not an efficiency win.
 
-See [`docs/BENCHMARK.md`](docs/BENCHMARK.md) for methodology and exact commands,
-and [`backend/benchmark_results/v3-official-3x/comparison.json`](backend/benchmark_results/v3-official-3x/comparison.json)
-for the official comparison.
+See [`docs/BENCHMARK.md`](docs/BENCHMARK.md) for methodology, results, and exact
+reproduction commands.
 
 ```powershell
 cd backend

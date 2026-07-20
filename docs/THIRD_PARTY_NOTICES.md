@@ -58,9 +58,6 @@ still contained 119 licensed installed-package records with the same counts.
 
 ## Repository media and data
 
-- `.qa-screenshots/` contains captures of Qwendom's own local UI produced during QA.
-- `dogfood-output/readiness-2026-07-13/screenshots/` and `videos/fresh-run.webm`
-  are captures of Qwendom's own local judge flow.
 - The benchmark incident packet and deterministic ground truth in
   `backend/benchmarks/fixtures/` were authored for this repository; they do not
   contain an imported external dataset.
