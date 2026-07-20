@@ -317,7 +317,12 @@ def resolve_specialist_bundle(template_id: str) -> ResolvedSpecialistBundle:
         if _SPECIALIST_SKILL_ROOT not in path.parents or not path.is_file():
             raise ValueError(f"specialist_skill_missing:{reference.skill_id}@{reference.version}")
         content_bytes = path.read_bytes()
-        actual_hash = hashlib.sha256(content_bytes).hexdigest()
+        # Git may materialize repository text with CRLF on Windows even though
+        # the pinned catalog hash was produced from the canonical LF content.
+        # Normalize only line endings before verification so the repository
+        # skill remains immutable across supported checkout platforms.
+        canonical_content_bytes = content_bytes.replace(b"\r\n", b"\n")
+        actual_hash = hashlib.sha256(canonical_content_bytes).hexdigest()
         if actual_hash != reference.sha256:
             raise ValueError(
                 f"specialist_skill_hash_mismatch:{reference.skill_id}@{reference.version}:"
@@ -328,7 +333,7 @@ def resolve_specialist_bundle(template_id: str) -> ResolvedSpecialistBundle:
                 skill_id=reference.skill_id,
                 version=reference.version,
                 sha256=actual_hash,
-                content=content_bytes.decode("utf-8"),
+                content=canonical_content_bytes.decode("utf-8"),
             )
         )
 
