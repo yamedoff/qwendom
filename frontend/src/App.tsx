@@ -29,6 +29,7 @@ import {
   RunCockpit,
   RunRecap,
   SocietyEvent,
+  TaskArtifact,
   TaskRun,
   createTask,
   getAgentDossier,
@@ -37,18 +38,18 @@ import {
   getRunCockpit,
   getRunRecap,
   getTask,
+  listTaskArtifacts,
   listAgentMemory,
   listAgents,
   listTaskEvents,
   listTasks,
-  submitClarification
 } from "./api";
-import "../../qwendom-v42-source/core.css";
+import "./core.css";
 import "./styles.css";
 
-type PageKey = "intake" | "live" | "review" | "recap" | "dossier";
+type PageKey = "intake" | "live" | "review" | "recap" | "artifacts" | "dossier" | "benchmark" | "architecture";
 
-const PAGE_KEYS: PageKey[] = ["intake", "live", "review", "recap", "dossier"];
+const PAGE_KEYS: PageKey[] = ["intake", "live", "review", "recap", "artifacts", "dossier", "benchmark", "architecture"];
 const PAGE_ALIASES: Record<string, PageKey> = {
   dossiers: "dossier",
 };
@@ -57,6 +58,30 @@ const MIN_PROMPT_LENGTH = 8;
 function validateMissionPrompt(value: string): string | null {
   if (value.trim().length >= MIN_PROMPT_LENGTH) return null;
   return "Add a short mission before convening the society.";
+}
+
+/**
+ * Backend treats both "complete" and "complete_with_warnings" as terminal
+ * completion. The latter finished successfully but emitted non-fatal warnings.
+ * Before this helper the UI only recognised "complete", so a warnings-bearing
+ * completion was misclassified as failed/partial and left polling/SSE active.
+ */
+const COMPLETED_STATUSES: ReadonlySet<string> = new Set(["complete", "complete_with_warnings"]);
+const isCompletedStatus = (status: string | null | undefined): boolean =>
+  status != null && COMPLETED_STATUSES.has(status);
+const TERMINAL_STATUSES: ReadonlySet<string> = new Set([...COMPLETED_STATUSES, "failed", "interrupted", "remediation"]);
+const isTerminalStatus = (status: string | null | undefined): boolean =>
+  status != null && TERMINAL_STATUSES.has(status);
+const TERMINAL_EVENT_TYPES: ReadonlySet<string> = new Set(["task_complete", "task_failed", "task_interrupted", "task_remediation"]);
+
+function dialRunState(status: string | null | undefined): string {
+  if (status === "running") return "live";
+  if (status === "queued") return "convening";
+  if (status === "waiting_for_user" || status === "interrupted") return "paused";
+  if (status === "remediation") return "remediation";
+  if (status === "failed") return "stopped";
+  if (isCompletedStatus(status)) return "complete";
+  return "inactive";
 }
 
 function runErrorMessage(error: unknown): string {
@@ -71,7 +96,7 @@ function useHashPage(): [PageKey, (key: PageKey) => void] {
   const read = (): PageKey => {
     const h = window.location.hash.replace("#", "");
     if ((PAGE_KEYS as string[]).includes(h)) return h as PageKey;
-    return PAGE_ALIASES[h] ?? "live";
+    return PAGE_ALIASES[h] ?? "intake";
   };
   const [page, setPageState] = useState<PageKey>(read);
   useEffect(() => {
@@ -82,6 +107,7 @@ function useHashPage(): [PageKey, (key: PageKey) => void] {
   const setPage = useCallback((key: PageKey) => {
     window.location.hash = key;
     setPageState(key);
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
   }, []);
   return [page, setPage];
 }
@@ -234,6 +260,22 @@ const phaseOf = (type: string, payload: Record<string, unknown> = {}): PhaseKey 
       return "leader_election";
     case "subtasks_assigned_from_brief":
       return "subtask_assignment";
+    case "specialist_selection_proposed":
+    case "specialist_selection_rejected":
+    case "specialist_selection_accepted":
+    case "specialist_invocation_approved":
+    case "specialist_invocation_started":
+    case "composition_assignment_materialized":
+    case "work_node_started":
+    case "work_node_blocked":
+    case "work_node_failed":
+    case "work_node_retry_scheduled":
+    case "work_node_canceled":
+    case "work_node_completed":
+    case "composition_assignment_cleanup_completed":
+    case "composition_assignment_cleanup_warning":
+    case "artifact_validated":
+      return "work_review";
     case "agent_tool_bundle_selected":
     case "artifact_section_critiqued":
     case "shared_artifact_revised":
@@ -281,6 +323,13 @@ interface PhaseGroup {
   events: SocietyEvent[];
 }
 
+const mergeEvents = (current: SocietyEvent[], incoming: SocietyEvent[]): SocietyEvent[] => {
+  const byId = new Map<string, SocietyEvent>();
+  for (const e of current) byId.set(e.id, e);
+  for (const e of incoming) byId.set(e.id, e);
+  return [...byId.values()].sort((a, b) => (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0));
+};
+
 const asString = (value: unknown): string | null =>
   typeof value === "string" && value.length > 0 ? value : null;
 const asStringArray = (value: unknown): string[] =>
@@ -289,6 +338,24 @@ const asNumber = (value: unknown): number | null => (typeof value === "number" &
 const asBoolean = (value: unknown): boolean | null => (typeof value === "boolean" ? value : null);
 const asRecord = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+
+/** Prefer the public roster identity wherever an event only carries an internal ID. */
+function displayIdentity(id: string | null | undefined, agents: Agent[], fallback = "Society member"): string {
+  if (!id) return fallback;
+  const agent = agents.find((item) => item.id === id);
+  return agent ? `${agent.name} — ${agent.role}` : fallback;
+}
+
+/** Turn small projection records into readable evidence without inventing a result. */
+function readableProjection(item: Record<string, unknown>): string {
+  const subject = asString(item.agent_name) ?? asString(item.actor_name) ?? asString(item.agent_id) ?? "A society member";
+  const change = asString(item.summary) ?? asString(item.reason) ?? asString(item.change) ?? asString(item.message);
+  const before = asString(item.before) ?? asString(item.previous_value);
+  const after = asString(item.after) ?? asString(item.new_value) ?? asString(item.value);
+  if (change) return `${subject}: ${change}`;
+  if (before && after) return `${subject}: ${before} → ${after}`;
+  return "A recorded change is available in the event evidence.";
+}
 
 const formatDeferrals = (defersTo: Record<string, string[]>): string[] =>
   Object.entries(defersTo).map(([agentId, domains]) => `${agentId}: ${domains.join(", ")}`);
@@ -480,28 +547,22 @@ type OfficeCode = typeof officeCodes[number];
 
 const officeForIndex = (index: number): OfficeCode => officeCodes[index % officeCodes.length];
 
-const officeLabelForAgent = (agent: Agent, index: number) => {
-  const role = roleKeyOf(agent);
-  if (role === "architect") return "Strategist";
-  if (role === "researcher") return "Archivist";
-  if (role === "critic") return "Risk Officer";
-  if (agent.profile.risk_tolerance === "high") return "Critic";
-  return index === 0 ? "Strategist" : "Builder";
-};
-
 function Rail({ status, health, currentPage, onNavigate, onTour }: { status: string; health: Health | null; currentPage: PageKey; onNavigate: (key: PageKey) => void; onTour: () => void }) {
   const navItems: { key: PageKey; label: string }[] = [
     { key: "intake", label: "Intake" },
     { key: "live", label: "Live run" },
     { key: "review", label: "Review" },
     { key: "recap", label: "Recap" },
-    { key: "dossier", label: "Dossier" }
+    { key: "artifacts", label: "Artifacts" },
+    { key: "dossier", label: "Dossier" },
+    { key: "benchmark", label: "Benchmark" },
+    { key: "architecture", label: "Architecture" }
   ];
   return (
     <>
       <aside className="rail">
         <div className="glyph"></div>
-        <div className="wordmark">Qwendom</div>
+        <div className="wordmark">Quendom</div>
         <div className="wordsub">WORKING SOCIETY</div>
         <nav className="railnav" aria-label="Screens">
           {navItems.map(({ key, label }) => (
@@ -523,7 +584,7 @@ function Rail({ status, health, currentPage, onNavigate, onTour }: { status: str
         </div>
       </aside>
       <div className="mobilebar">
-        <div><div className="wordmark">Qwendom</div></div>
+        <div><div className="wordmark">Quendom</div></div>
         <span className="rail-live"><span className="pulse"></span>{status.toUpperCase()}</span>
       </div>
     </>
@@ -560,11 +621,10 @@ function DotStrip({ currentPhaseIndex, cockpit }: { currentPhaseIndex: number; c
   );
 }
 
-function OfficeDial({ agent, index, cockpit }: { agent: Agent; index: number; cockpit?: RunCockpit | null }) {
+function OfficeDial({ agent, index, cockpit, runStatus }: { agent: Agent; index: number; cockpit?: RunCockpit | null; runStatus?: TaskRun["status"] }) {
   const stance = stanceForAgent(agent, cockpit);
   const office = officeForIndex(index);
-  const label = officeLabelForAgent(agent, index);
-  const isLeader = cockpit?.participants.some((p) => p.agent_id === agent.id && p.is_leader) ?? index === 0;
+  const isLeader = cockpit?.participants.some((p) => p.agent_id === agent.id && p.is_leader) ?? false;
   return (
     <div className="dial" tabIndex={0}>
       <div className="dial-ring">
@@ -575,9 +635,10 @@ function OfficeDial({ agent, index, cockpit }: { agent: Agent; index: number; co
         />
         <span className={`orb ${office}`}></span>
       </div>
-      <div className="name">{label}</div>
+      <div className="name">{agent.name}</div>
+      <div className="dial-role">{agent.role}</div>
       {isLeader && <div className="lead">LEAD</div>}
-      <span className={`chip ${stance}`}>{stance.toUpperCase()}</span><span className="since">live</span>
+      <span className={`chip ${stance}`}>{stance.toUpperCase()}</span><span className="since">{dialRunState(runStatus)}</span>
       <div className="dial-hist">
         <div className="dh-label">STANCE HISTORY</div>
         <div className="dh-row"><span>{agent.profile.communication_style}</span><span className="t">now</span></div>
@@ -587,36 +648,89 @@ function OfficeDial({ agent, index, cockpit }: { agent: Agent; index: number; co
   );
 }
 
-function typedTurnClass(event: SocietyEvent) {
+type LedgerTurnKind = "support" | "propose" | "challenge" | "block" | "revision" | "direct";
+
+function typedTurnClass(event: SocietyEvent): LedgerTurnKind {
   if (event.type === "agent_objection_registered") return asBoolean(event.payload.blocks_execution) ? "block" : "challenge";
-  if (event.type === "agent_changed_mind") return "concede";
+  if (event.type === "agent_changed_mind") return "revision";
   if (event.type === "agent_position_stated") {
     const stance = asString(event.payload.stance);
     if (stance?.includes("challenge")) return "challenge";
     if (stance?.includes("block")) return "block";
+    if (stance?.includes("oppose")) return "challenge";
+    if (stance?.includes("support") || stance?.includes("aligned") || stance?.includes("builds_on")) return "support";
     return "propose";
   }
   if (event.type === "conversation_turn") return "direct";
   return "propose";
 }
 
+function humanEventLabel(type: string): string {
+  const labels: Record<string, string> = {
+    agent_position_stated: "POSITION",
+    agent_objection_registered: "BLOCKER",
+    agent_changed_mind: "REVISED VIEW",
+    targeted_question_answered: "EVIDENCE RETURNED",
+    subtasks_assigned_from_brief: "WORK DELEGATED",
+    delegation_assigned: "WORK DELEGATED",
+    leader_elected: "LEADER CHOSEN",
+    solution_selected: "DECISION",
+    shared_artifact_revised: "ARTIFACT REVISED",
+    meeting_recap: "HANDOFF"
+  };
+  return labels[type] ?? type.replaceAll("_", " ").toUpperCase();
+}
+
+/** Only expose a canonical constraint ID; actor IDs are implementation detail. */
+function blockerLabel(value: string | null): string | null {
+  return value && /^C-[A-Za-z0-9_-]+$/.test(value) ? value : null;
+}
+
+/** Keep event freshness readable without exposing unstable raw second counts. */
+function elapsedLabel(seconds: number): string {
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 function TypedTurn({ event, index, agents }: { event: SocietyEvent; index: number; agents: Agent[] }) {
   const turnType = typedTurnClass(event);
   const actor = event.actor ?? asString(event.payload.agent_id) ?? asString(event.payload.actor) ?? `office-${index + 1}`;
+  const agent = agents.find((item) => item.id === actor);
+  const stance = asString(event.payload.stance)?.toLowerCase();
   const office = officeForIndex(index);
   const reason = asString(event.payload.reason) ?? asString(event.payload.critique) ?? asString(event.payload.says);
   const delegateTargets = asRecord(event.payload.delegates) ?? asRecord(event.payload.delegation);
+  const constraintId = blockerLabel(asString(event.payload.constraint_id));
+  const auditSummary = turnType === "block"
+    ? "Blocker record · execution pauses until its condition is resolved"
+    : turnType === "revision"
+      ? "Revision record · the agent changed its position"
+      : turnType === "challenge"
+        ? "Challenge record · the agent questioned the current assumption"
+        : turnType === "support"
+          ? "Support record · the agent backed the current path"
+          : "Decision update · the agent proposed a path";
   return (
     <div className={`turn ${turnType}`}>
       <div className="turn-top">
         <span className={`orb ${office}`}></span>
-        <span className="name">{actor}</span>
-        <span className="role">{event.type.replaceAll("_", " ")}</span>
+        <span className="name">{agent?.name ?? actor}</span>
+        <span className="role">{agent?.role ?? humanEventLabel(event.type)}</span>
         <span className={`ttag ${turnType}`}>{turnType.toUpperCase()}</span>
         <span className="time">{new Date(event.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
       </div>
-      <div className="tx">{event.message}</div>
-      {turnType === "direct" && (delegateTargets || agents.length > 1) && (
+      <div className="tx">
+        {event.type === "agent_position_stated" && stance
+          ? `${agent?.name ?? actor} ${stance === "oppose" ? "challenges" : stance === "block" ? "blocks" : stance === "support" ? "supports" : "frames"} the current path.`
+          : event.type === "agent_objection_registered"
+            ? `${agent?.name ?? actor} blocks the current path until the condition below is met.`
+            : event.message}
+      </div>
+      {turnType === "direct" && delegateTargets && (
         <div className="t-delegate">
           {(delegateTargets
             ? Object.entries(delegateTargets).slice(0, 4)
@@ -630,15 +744,20 @@ function TypedTurn({ event, index, agents }: { event: SocietyEvent; index: numbe
           ))}
         </div>
       )}
-      {reason && turnType !== "direct" && <div className="t-anchor">↳ {reason}</div>}
-      {turnType === "block" && (
-        <>
-          <div className="t-struct t-violation"><span className="lbl">VIOLATED CONSTRAINT</span><span className="cid">{asString(event.payload.constraint_id) ?? "C-?"}</span>{asString(event.payload.target) ?? "Execution path blocked until risk is resolved."}</div>
+      {(reason || turnType === "block" || turnType === "revision") && (
+        <details className="ledger-audit-row">
+          <summary>{auditSummary}</summary>
+          {reason && turnType !== "direct" && <div className="t-anchor">↳ {reason}</div>}
+          {turnType === "block" && (
+            <>
+          <div className="t-struct t-violation"><span className="lbl">GOVERNANCE GATE</span>{constraintId && <span className="cid">{constraintId}</span>}<span className="t-struct-copy">{asString(event.payload.target) ?? "Execution path blocked until risk is resolved."}</span></div>
           <div className="t-struct t-lift"><span className="lbl">CONDITION TO LIFT</span>{asString(event.payload.resolution_condition) ?? asString(event.payload.condition) ?? "A responsible office must revise the proposal and satisfy the blocker."}</div>
-        </>
-      )}
-      {turnType === "concede" && (
-        <div className="t-struct t-flip"><span className="lbl">WHAT CHANGED</span><span className="from">{asString(event.payload.previous_position) ?? "Previous stance"}</span><span className="arr">→</span><span className="to">{asString(event.payload.new_position) ?? "Updated stance"}</span></div>
+            </>
+          )}
+          {turnType === "revision" && (
+            <div className="t-struct t-flip"><span className="lbl">WHAT CHANGED</span><span className="from">{asString(event.payload.previous_position) ?? "Previous stance"}</span><span className="arr">→</span><span className="to">{asString(event.payload.new_position) ?? "Updated stance"}</span></div>
+          )}
+        </details>
       )}
     </div>
   );
@@ -794,10 +913,12 @@ function ArtifactsCard({ events }: { events: SocietyEvent[] }) {
 
 function IntakePage({
   onSubmit,
+  error,
   openExplainer,
   setOpenExplainer
 }: {
   onSubmit: (prompt: string) => void;
+  error: string | null;
   openExplainer: string | null;
   setOpenExplainer: (id: string | null) => void;
 }) {
@@ -805,9 +926,16 @@ function IntakePage({
   const [scope, setScope] = useState("");
   const [constraints, setConstraints] = useState("");
   const [criteria, setCriteria] = useState("");
+  const [missionError, setMissionError] = useState<string | null>(null);
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
+    const validationError = validateMissionPrompt(title);
+    if (validationError) {
+      setMissionError(validationError);
+      return;
+    }
+    setMissionError(null);
     const combined = `${title}\n\nScope: ${scope}\n\nConstraints:\n${constraints}\n\nSuccess criteria: ${criteria}`;
     onSubmit(combined);
   }
@@ -818,12 +946,23 @@ function IntakePage({
       <h1 className="hero-title">Brief the society.</h1>
       <p className="hero-sub">A task force convenes around this brief, aligns on the goal, and decides whether it is ready to begin.</p>
 
+      <div className="intake-flow" aria-label="What happens after a mission is submitted">
+        {[
+          "Discuss the brief",
+          "Choose a leader",
+          "Delegate fixed specialists",
+          "Validate independently",
+          "Deliver recorded artifacts"
+        ].map((step, index) => <span key={step}><b>{index + 1}</b>{step}</span>)}
+      </div>
+
       <form className="intake-wrap" onSubmit={handleSubmit}>
         <Explainer id="intake-form" title="Numbered brief form" text="Mission, scope, constraints, and success criteria as numbered sections. The society uses this brief as the starting mission context and revises it only when the run emits supporting events." openId={openExplainer} setOpenId={setOpenExplainer}>
           <div className="field">
             <span className="fnum">01</span>
             <label htmlFor="f-title">Mission</label>
             <input className="input big" id="f-title" value={title} onChange={(e) => setTitle(e.target.value)} />
+            {missionError && <p className="field-error" role="alert">{missionError}</p>}
           </div>
           <div className="field">
             <span className="fnum">02</span>
@@ -844,6 +983,7 @@ function IntakePage({
         </Explainer>
 
         <button className="convene" type="submit">Convene society<span className="arrow">→</span></button>
+        {error && <div className="error" role="alert">{error}</div>}
         <p className="convene-sub">Live agent roster · readiness gate before any work begins</p>
       </form>
     </section>
@@ -860,6 +1000,67 @@ function EmptyProjectionPage({ title, message }: { title: string; message: strin
   );
 }
 
+function BenchmarkPage() {
+  const metrics = [
+    ["Task completion", "Required output contract and mandatory gates finish for the recorded scenario."],
+    ["Evidence coverage", "Required acceptance checks, provenance, and recorded artifacts are present and attributable."],
+    ["Independent validation", "A validator verifies the delivery separately from the producing specialist or run."],
+    ["Collaboration trace", "The ledger shows decisions, handoffs, challenges, and the evidence behind the verdict."],
+    ["Latency / cost", "Reported only when the record includes comparable wall time, tokens, or tool-credit accounting."]
+  ];
+  const evidence = ["scenario definition and declared baseline", "run ledger and decision trace", "artifact manifest and acceptance evidence", "independent validation result", "final verdict and recorded warnings or cleanup"];
+  return <section className="view explainer-page">
+    <div className="kicker">BENCHMARK · <em>EVIDENCE FIRST</em></div>
+    <h1 className="hero-title">How the society is evaluated.</h1>
+    <p className="hero-sub">This page explains the evaluation frame. It does not claim the society outperforms a baseline unless a recorded result supports that claim.</p>
+    <div className="explainer-overview">
+      <span className="eyebrow">SOCIETY VS. DECLARED BASELINE</span>
+      <p>The benchmark compares the society with the baseline named in the recorded benchmark. Each side receives the same controlled scenario inputs, output contract, and evaluation rules; the UI does not infer a baseline or fill gaps in a run record.</p>
+    </div>
+    <section className="explainer-section" aria-labelledby="benchmark-flow">
+      <div className="section-label" id="benchmark-flow">EVALUATION LIFECYCLE</div>
+      <div className="explainer-flow" aria-label="Benchmark evaluation lifecycle">
+        {["Freeze scenario", "Run both modes", "Collect artifacts", "Validate independently", "Record verdict"].map((stage, index) => <span key={stage}><b>{String(index + 1).padStart(2, "0")}</b>{stage}{index < 4 && <i aria-hidden="true">→</i>}</span>)}
+      </div>
+      <p className="hint">Controlled inputs include the scenario definition, fixtures, acceptance checks, budgets, and evaluator rules recorded for that comparison.</p>
+    </section>
+    <section className="explainer-section" aria-labelledby="benchmark-metrics">
+      <div className="section-label" id="benchmark-metrics">WHAT IS MEASURED</div>
+      <div className="metric-table" role="table" aria-label="Benchmark metric definitions">
+        {metrics.map(([metric, definition]) => <div className="metric-row" role="row" key={metric}><strong role="cell">{metric}</strong><span role="cell">{definition}</span></div>)}
+      </div>
+    </section>
+    <div className="recap-grid">
+      <div className="card"><div className="card-head"><span className="card-title">EVIDENCE CHECKLIST</span></div><div className="card-body"><ul className="explainer-list">{evidence.map((item) => <li key={item}>{item}</li>)}</ul><p className="hint">Inspect the <a href="#live">Live</a>, <a href="#review">Review</a>, <a href="#recap">Recap</a>, <a href="#dossier">Dossier</a>, and <a href="#artifacts">Artifacts</a> views for run-level evidence when it exists.</p></div></div>
+      <div className="card"><div className="card-head"><span className="card-title">HOW TO READ A VERDICT</span></div><div className="card-body"><dl className="status-key"><div><dt>Complete</dt><dd>Required result and recorded evidence passed.</dd></div><div><dt>Partial</dt><dd>Some work or proof is missing; it is not a clean comparison.</dd></div><div><dt>Warnings</dt><dd>The run completed with non-fatal issues that remain part of its record.</dd></div><div><dt>Failed</dt><dd>A required gate, execution step, or validation did not pass.</dd></div></dl></div></div>
+      <div className="card"><div className="card-head"><span className="card-title">LIMITATIONS</span></div><div className="card-body"><p>A successful run alone is not a superiority result. Non-comparable inputs, missing validation, incomplete artifacts, or unrecorded cost and latency cannot establish a fair advantage.</p><p className="hint">Quality, speed, and cost must be interpreted from comparable recorded data, not from discussion volume or model narration.</p></div></div>
+      <div className="card"><div className="card-head"><span className="card-title">CURRENT RESULTS</span></div><div className="card-body"><p>Published comparable results would appear with their scenario, baseline, evidence, and verdict. Until then, this is an explainer—not a scoreboard.</p><p className="empty-state">No comparable recorded benchmark result is presented here.</p></div></div>
+    </div>
+  </section>;
+}
+
+function ArchitecturePage() {
+  const stages = ["Intake", "Society discussion", "Readiness", "Leader", "Fixed specialists", "AgentBay", "Independent validation", "Artifacts", "Verdict"];
+  return <section className="view explainer-page">
+    <div className="kicker">ARCHITECTURE · <em>RUN FLOW</em></div>
+    <h1 className="hero-title">From brief to verdict.</h1>
+    <p className="hero-sub">A recording-friendly map of the current delivery path. It describes responsibility boundaries; the ledger remains the evidence for any individual run.</p>
+    <div className="architecture-flow" aria-label="Society execution flow">{stages.map((stage, index) => <span key={stage}><b>{String(index + 1).padStart(2, "0")}</b>{stage}{index < stages.length - 1 && <i aria-hidden="true">→</i>}</span>)}</div>
+    <div className="recap-grid">
+      <div className="card"><div className="card-head"><span className="card-title">SOCIETY → EMPLOYEES</span></div><div className="card-body"><p>Core society roles interpret the brief, surface risks, reach readiness, and elect a leader. The elected leader selects fixed specialist employees for bounded execution; the specialists are distinct from the deliberating society.</p><p className="hint">The leader selects from the repository-defined catalog. It does not author a new team or grant capabilities.</p></div></div>
+      <div className="card"><div className="card-head"><span className="card-title">FIXED TOOLS & VERSIONED SKILLS</span></div><div className="card-body"><p>Tools and skills are repository-owned, versioned bundles attached to each specialist template. They are resolved and verified by the runtime—not granted, removed, or invented by model output.</p><p className="hint">A missing required tool or mismatched skill blocks execution visibly instead of silently shrinking the job.</p></div></div>
+      <div className="card"><div className="card-head"><span className="card-title">AGENTBAY EXECUTION</span></div><div className="card-body"><p>Specialists execute bounded work in AgentBay sandboxes. The lifecycle records setup, work, exported artifacts, failures or cancellation, and cleanup; a sandbox is not evidence of completion by itself.</p><p className="hint">Independent validation checks the delivered artifacts after execution rather than trusting the producer’s narration.</p></div></div>
+      <div className="card"><div className="card-head"><span className="card-title">EVENTS → VIEWER</span></div><div className="card-body"><p>The event stream feeds the <a href="#live">Live</a> ledger and projections for <a href="#review">Review</a>, <a href="#recap">Recap</a>, <a href="#dossier">Dossier</a>, and <a href="#artifacts">Artifacts</a>. These views reconstruct recorded state; they do not invent it.</p></div></div>
+      <div className="card"><div className="card-head"><span className="card-title">CLARIFICATION & PAUSE</span></div><div className="card-body"><p>If the society needs user input, it records a clarification request and pauses at that boundary. The answer and resume event remain in the causal trace, so viewers can see what changed before work continues.</p></div></div>
+      <div className="card"><div className="card-head"><span className="card-title">TRUTH, FAILURE & VERDICT</span></div><div className="card-body"><p>Validation results, blockers, retries, cancellations, and cleanup are part of the run record. A verdict reflects recorded acceptance evidence and validation—not a claim that an artifact exists, a tool ran, or a sandbox closed when the ledger cannot show it.</p></div></div>
+    </div>
+    <section className="explainer-section viewer-guide" aria-labelledby="viewer-guide">
+      <div className="section-label" id="viewer-guide">WHAT TO WATCH DURING A LIVE RUN</div>
+      <div className="metric-table"><div className="metric-row"><strong>Live</strong><span>Society discussion, readiness, leadership, specialist work, events, and blockers as they are emitted.</span></div><div className="metric-row"><strong>Review / Recap</strong><span>Decision rationale, the condensed causal sequence, and the recorded terminal state.</span></div><div className="metric-row"><strong>Dossier / Artifacts</strong><span>Role context, exported deliverables, ownership, provenance, and validation status where the run provides them.</span></div></div>
+    </section>
+  </section>;
+}
+
 function EvidenceNotice({ status, missing }: { status: string; missing: string[] }) {
   if (status === "complete") return null;
   return (
@@ -867,6 +1068,11 @@ function EvidenceNotice({ status, missing }: { status: string; missing: string[]
       Evidence is {status}. Missing sources: {missing.length > 0 ? missing.join(", ") : "none reported"}.
     </div>
   );
+}
+
+/** Deduplicate exact repeated model output before it reaches a judge-facing view. */
+function uniqueDisplayText(items: string[]): string[] {
+  return Array.from(new Set(items.map((item) => item.replace(/\s+/g, " ").trim()).filter(Boolean)));
 }
 
 function ReviewPage({
@@ -877,7 +1083,6 @@ function ReviewPage({
 }: {
   task: TaskRun | null;
   review: DecisionReview | null;
-  events: SocietyEvent[];
   openExplainer: string | null;
   setOpenExplainer: (id: string | null) => void;
 }) {
@@ -888,11 +1093,14 @@ function ReviewPage({
     return <EmptyProjectionPage title="Decision review" message="Decision projection is not loaded. If the backend is offline, no review data is fabricated." />;
   }
   const hasOpinions = review.proposal_opinions.length > 0;
-  const hasBlocking = review.blocking_objections.length > 0;
+  const blockingObjections = uniqueDisplayText(review.blocking_objections);
+  const unresolvedDissent = uniqueDisplayText(review.unresolved_dissent);
+  const hasBlocking = blockingObjections.length > 0;
   const hasNonBlocking = review.non_blocking_dissent.length > 0;
-  const hasUnresolved = review.unresolved_dissent.length > 0;
+  const hasUnresolved = unresolvedDissent.length > 0;
   const isRunning = task.status === "running";
   const failedBeforeProposals = task.status === "failed" && review.proposals.length === 0;
+  const durableArtifacts = review.supporting_artifacts.filter((artifact) => artifact.type === "durable_artifact");
 
   return (
     <section className="view">
@@ -920,6 +1128,15 @@ function ReviewPage({
         </div>
       )}
       <EvidenceNotice status={review.evidence_status} missing={review.missing_sources} />
+      {durableArtifacts.length > 0 && (
+        <div className="card" style={{ marginBottom: 18 }}>
+          <div className="card-body">
+            <strong>DELIVERY EVIDENCE RECORDED</strong>
+            <p className="hint">{durableArtifacts.length} durable artifact{durableArtifacts.length === 1 ? "" : "s"} emitted by execution. Open the artifact record for integrity and validation details.</p>
+            <a className="artifact-entry" href="#artifacts">Open this run's artifacts →</a>
+          </div>
+        </div>
+      )}
 
       {review.winner_rationale && (
         <div className="card" style={{ marginBottom: 18 }}>
@@ -950,8 +1167,10 @@ function ReviewPage({
 
       {hasBlocking && (
         <div className="error" style={{ marginBottom: 18 }}>
-          <strong>BLOCKING OBJECTIONS ({review.blocking_objections.length})</strong>
-          {review.blocking_objections.map((obj, i) => <div key={`bo-${i}`}>{obj}</div>)}
+          <strong>ACTIVE BLOCKERS ({blockingObjections.length})</strong>
+          <p className="hint">Resolve one of these conditions to let the society continue.</p>
+          {blockingObjections.slice(0, 3).map((obj, i) => <div key={`bo-${i}`}>{obj}</div>)}
+          {blockingObjections.length > 3 && <p className="hint">{blockingObjections.length - 3} additional blocker reports are collapsed.</p>}
         </div>
       )}
 
@@ -964,7 +1183,7 @@ function ReviewPage({
         <div className="bignum-sep"></div>
         <div className="bignum"><div className="n">{String(review.revisions.length).padStart(2, "0")}</div><div className="l">Revisions</div></div>
         <div className="bignum-sep"></div>
-        <div className="bignum"><div className="n">{String(review.unresolved_dissent.length).padStart(2, "0")}</div><div className="l">Unresolved dissent</div></div>
+        <div className="bignum"><div className="n">{String(unresolvedDissent.length).padStart(2, "0")}</div><div className="l">Unresolved dissent</div></div>
       </div>
 
       <div className="duel">
@@ -1059,7 +1278,8 @@ function ReviewPage({
             {hasUnresolved && (
               <>
                 <div className="kv" style={{ marginTop: 10 }}>UNRESOLVED DISSENT</div>
-                {review.unresolved_dissent.map((item, i) => <div className="dissent-note" key={`ud-${i}`}>{item}</div>)}
+                {unresolvedDissent.slice(0, 3).map((item, i) => <div className="dissent-note" key={`ud-${i}`}>{item}</div>)}
+                {unresolvedDissent.length > 3 && <p className="hint">{unresolvedDissent.length - 3} additional dissent reports are collapsed.</p>}
               </>
             )}
           </div>
@@ -1072,6 +1292,7 @@ function ReviewPage({
 function RecapPage({
   task,
   recap,
+  events,
   openExplainer,
   setOpenExplainer
 }: {
@@ -1088,10 +1309,15 @@ function RecapPage({
     return <EmptyProjectionPage title="Run recap" message="Recap projection is not loaded. If the backend is offline, no recap is fabricated." />;
   }
   const minutes = recap.duration_seconds == null ? null : Math.max(1, Math.round(recap.duration_seconds / 60));
-  const outcomeLabel = recap.completion_outcome === "complete" ? "COMPLETE" : recap.completion_outcome === "failed" ? "FAILED" : recap.completion_outcome === "waiting_for_user" ? "WAITING" : "PARTIAL";
+  const outcomeLabel = recap.completion_outcome === "complete" ? "COMPLETE" : recap.completion_outcome === "complete_with_warnings" ? "COMPLETE WITH WARNINGS" : recap.completion_outcome === "failed" ? "FAILED" : recap.completion_outcome === "waiting_for_user" ? "WAITING" : "PARTIAL";
   const isRunning = task.status === "running";
   const recapTitle = isRunning ? "Run in progress" : "Run recap";
   const recapKicker = isRunning ? "RUN STATE" : "AFTER-ACTION";
+  // A recap can be partial while the run is paused; the event log remains the
+  // authoritative source for objection count until the recap summarizes it.
+  const observedDissentCount = events.filter((event) => event.type === "agent_objection_registered").length;
+  const dissentCount = Math.max(recap.dissents.length, observedDissentCount);
+  const savedLessons = uniqueDisplayText(recap.saved_lessons);
 
   return (
     <section className="view">
@@ -1102,10 +1328,13 @@ function RecapPage({
           ? `This run is still active. The recap is intentionally partial and only reflects events emitted so far. Status: ${recap.status}.`
           : recap.completion_outcome === "complete"
           ? "Projected from completed society events."
-          : recap.completion_outcome === "failed"
+          : recap.completion_outcome === "complete_with_warnings"
+            ? "Projected from completed society events. The run finished with warnings."
+            : recap.completion_outcome === "failed"
             ? "This run did not complete. See failure details below."
             : `Partial recap from actual events. Status: ${recap.status}.`}
       </p>
+      <a className="artifact-entry" href="#artifacts">Open this run's artifacts →</a>
       <EvidenceNotice status={recap.evidence_status} missing={recap.missing_sources} />
 
       {recap.failure && (
@@ -1135,11 +1364,11 @@ function RecapPage({
         <div className="bignum-sep"></div>
         <div className="bignum"><div className="n">{String(recap.events).padStart(2, "0")}</div><div className="l">Events emitted</div></div>
         <div className="bignum-sep"></div>
-        <div className="bignum"><div className="n">{String(recap.dissents.length).padStart(2, "0")}</div><div className="l">Dissents raised</div></div>
+        <div className="bignum"><div className="n">{String(dissentCount).padStart(2, "0")}</div><div className="l">Dissents raised</div></div>
         <div className="bignum-sep"></div>
         <div className="bignum"><div className="n">{String(recap.mind_changes.length).padStart(2, "0")}</div><div className="l">Mind changed</div></div>
         <div className="bignum-sep"></div>
-        <div className="bignum"><div className="n">{String(recap.saved_lessons.length).padStart(2, "0")}</div><div className="l">Lessons saved</div></div>
+        <div className="bignum"><div className="n">{String(savedLessons.length).padStart(2, "0")}</div><div className="l">Lessons saved</div></div>
       </div>
 
       <div className="recap-grid">
@@ -1168,9 +1397,10 @@ function RecapPage({
         <div className="card">
           <div className="card-head"><span className="card-title"><span className="ic">!</span>DISSENTS & LESSONS</span></div>
           <div className="card-body">
-            {recap.saved_lessons.length === 0 && recap.dissents.length === 0 && <p className="empty-state">No saved lessons or carried dissent have been emitted.</p>}
-            {recap.saved_lessons.map((item, index) => <div className="lesson" key={`lesson-${index}`}><span className="lid">LESSON</span><p>{item}</p></div>)}
+            {savedLessons.length === 0 && recap.dissents.length === 0 && observedDissentCount === 0 && <p className="empty-state">No saved lessons or carried dissent have been emitted.</p>}
+            {savedLessons.map((item, index) => <div className="lesson" key={`lesson-${index}`}><span className="lid">LESSON</span><p>{item}</p></div>)}
             {recap.dissents.map((item, index) => <div className="lesson dnote" key={`dissent-${index}`}><span className="lid">DISSENT</span><p>{item}</p></div>)}
+            {recap.dissents.length === 0 && observedDissentCount > 0 && <p className="hint">{observedDissentCount} dissent event{observedDissentCount === 1 ? "" : "s"} recorded; detailed summaries are pending.</p>}
           </div>
         </div>
         <div className="card">
@@ -1178,7 +1408,7 @@ function RecapPage({
           <div className="card-body">
             {recap.trust_reputation_changes.length === 0 && <p className="empty-state">No trust or reputation change events have been emitted.</p>}
             {recap.trust_reputation_changes.map((item, index) => (
-              <div className="point" key={`tr-${index}`}>{item.type?.toString().replaceAll("_", " ") ?? "change"}: {JSON.stringify(item.payload ?? {}).slice(0, 200)}</div>
+              <div className="point" key={`tr-${index}`}><strong>{item.type?.toString().replaceAll("_", " ") ?? "Recorded change"}</strong><div className="hint">{readableProjection(asRecord(item.payload) ?? item)}</div></div>
             ))}
           </div>
         </div>
@@ -1189,7 +1419,7 @@ function RecapPage({
           <div className="card-head"><span className="card-title"><span className="ic">↕</span>SOCIAL DELTAS</span></div>
           <div className="card-body">
             {recap.social_deltas.map((item, index) => (
-              <div className="point" key={`sd-${index}`}>{JSON.stringify(item).slice(0, 240)}</div>
+              <div className="point" key={`sd-${index}`}>{readableProjection(item)}</div>
             ))}
           </div>
         </div>
@@ -1216,11 +1446,75 @@ function RecapPage({
       {recap.final_answer && (
         <div className="card" style={{ marginTop: 18 }}>
           <div className="card-head"><span className="card-title"><span className="ic">✓</span>FINAL ANSWER</span></div>
-          <div className="card-body"><p>{recap.final_answer}</p></div>
+          <div className="card-body readable-output">{recap.final_answer}</div>
         </div>
       )}
     </section>
   );
+}
+
+function artifactUrl(path: string): string {
+  return /^https?:\/\//i.test(path) ? path : `${API_BASE}${path}`;
+}
+
+function formatBytes(bytes?: number | null): string {
+  if (bytes == null) return "Size not recorded";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function artifactPreviewKind(artifact: TaskArtifact): "image" | "video" | "text" | null {
+  const type = artifact.media_type?.toLowerCase() ?? "";
+  const name = artifact.filename.toLowerCase();
+  if (type.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg)$/.test(name)) return "image";
+  if (type.startsWith("video/") || /\.(mp4|webm|ogg|mov)$/.test(name)) return "video";
+  if (type.startsWith("text/") || /\.(txt|md|json|ya?ml|tsx?|jsx?|css|html?|py|js|java|go|rs|sh|sql)$/.test(name)) return "text";
+  return null;
+}
+
+function ArtifactPage({ task, artifacts, loading, error }: { task: TaskRun | null; artifacts: TaskArtifact[]; loading: boolean; error: string | null }) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [previewText, setPreviewText] = useState<Record<string, string>>({});
+  const [previewErrors, setPreviewErrors] = useState<Record<string, string>>({});
+  useEffect(() => { setExpandedId(null); setPreviewText({}); setPreviewErrors({}); }, [task?.id]);
+  useEffect(() => {
+    const artifact = artifacts.find((item) => item.id === expandedId);
+    if (!artifact?.view_url || (artifact.status != null && artifact.status !== "available") || artifactPreviewKind(artifact) !== "text" || previewText[artifact.id] || previewErrors[artifact.id]) return;
+    let cancelled = false;
+    fetch(artifactUrl(artifact.view_url)).then(async (response) => {
+      if (!response.ok) throw new Error("Safe text preview is unavailable.");
+      return response.text();
+    }).then((text) => { if (!cancelled) setPreviewText((current) => ({ ...current, [artifact.id]: text })); })
+      .catch((previewError: unknown) => { if (!cancelled) setPreviewErrors((current) => ({ ...current, [artifact.id]: previewError instanceof Error ? previewError.message : "Safe text preview is unavailable." })); });
+    return () => { cancelled = true; };
+  }, [artifacts, expandedId, previewErrors, previewText]);
+  if (!task) return <EmptyProjectionPage title="Artifacts" message="No run is selected. Create or replay a run before viewing its durable outputs." />;
+  return <section className="view">
+    <div className="kicker">DELIVERABLES · <em>RUN-SCOPED</em></div>
+    <h1 className="hero-title">Artifacts</h1>
+    <p className="hero-sub">Durable outputs recorded for this run. Preview and download are available only for integrity-verified artifacts when the backend supplies those safe routes.</p>
+    {loading && <p className="hint">Loading recorded artifacts…</p>}
+    {error && <div className="error">Artifacts could not be loaded: {error}</div>}
+    {!loading && !error && artifacts.length === 0 && <div className="card"><div className="card-body empty-state">No durable artifacts have been recorded for this run.</div></div>}
+    <div className="artifact-list">{artifacts.map((artifact) => {
+      // Older retained runs may not carry status; preserve their existing safe-route behavior.
+      const isAvailable = artifact.status == null || artifact.status === "available";
+      const previewKind = isAvailable && artifact.view_url ? artifactPreviewKind(artifact) : null;
+      const expanded = expandedId === artifact.id;
+      return <article className="card artifact-card" key={artifact.id}><div className="card-body">
+        <div className="artifact-head"><div><strong>{artifact.filename}</strong><span>{artifact.kind ?? artifact.media_type ?? "Unclassified artifact"}</span></div>{isAvailable && artifact.download_url && <a className="artifact-download" href={artifactUrl(artifact.download_url)} target="_blank" rel="noreferrer">Download</a>}</div>
+        <dl className="artifact-meta"><div><dt>Type</dt><dd>{artifact.media_type ?? artifact.kind ?? "Not recorded"}</dd></div><div><dt>Size</dt><dd>{formatBytes(artifact.size_bytes)}</dd></div><div><dt>Validation</dt><dd>{artifact.validation_status ?? "Not validated"}</dd></div><div><dt>Producer</dt><dd>{artifact.producer ?? "Not recorded"}</dd></div><div className="artifact-digest"><dt>SHA-256</dt><dd>{artifact.sha256 ?? "Digest not recorded"}</dd></div></dl>
+        {!isAvailable && <p className="hint">{artifact.status === "integrity_failed" ? "Integrity verification failed; this artifact is not available for preview or download." : "This artifact is missing from durable storage; preview and download are unavailable."}</p>}
+        {isAvailable && !artifact.view_url && <p className="hint">No safe inline preview was provided for this artifact. Download it to inspect the original.</p>}
+        {isAvailable && artifact.view_url && !previewKind && <p className="hint">A safe view exists, but this artifact type has no inline renderer. Download it to inspect the original.</p>}
+        {previewKind && <button className="artifact-preview-toggle" type="button" onClick={() => setExpandedId(expanded ? null : artifact.id)}>{expanded ? "Hide preview" : "Preview"}</button>}
+        {expanded && previewKind === "image" && <img className="artifact-preview-image" src={artifactUrl(artifact.view_url!)} alt={`Preview of ${artifact.filename}`} />}
+        {expanded && previewKind === "video" && <video className="artifact-preview-video" controls src={artifactUrl(artifact.view_url!)}>Your browser cannot preview this video.</video>}
+        {expanded && previewKind === "text" && <pre className="artifact-preview-text">{previewErrors[artifact.id] ?? previewText[artifact.id] ?? "Loading safe text preview…"}</pre>}
+      </div></article>;
+    })}</div>
+  </section>;
 }
 
 function DossierPage({
@@ -1343,11 +1637,11 @@ function DossierPage({
             <div className="card">
               <div className="card-head"><span className="card-title"><span className="ic">⚙</span>TOOL USAGE THIS RUN</span></div>
               <div className="card-body">
-                {dossier.run_tool_usage.map((tool) => (
+                {dossier.run_tool_usage.slice(0, 6).map((tool) => (
                   <div className="point" key={tool.source_event_id}>
                     <strong>{tool.tool_name}</strong> [{tool.phase ?? "?"}]
-                    {tool.why_used && <div className="hint">Why: {tool.why_used}</div>}
-                    {tool.result_summary && <div className="hint">Result: {tool.result_summary}</div>}
+                    {tool.why_used && !tool.why_used.startsWith("Task:") && <div className="hint">Purpose: {tool.why_used}</div>}
+                    {tool.result_summary && !/^round,\s*agent_id|^objective,\s*steps|^agent_id,\s*phase/i.test(tool.result_summary) && <div className="hint">Outcome: {tool.result_summary}</div>}
                     <span className={`pillstat ${tool.success ? "done" : "challenged"}`} style={{ marginTop: 4 }}>{tool.success ? "OK" : "FAILED"}</span>
                   </div>
                 ))}
@@ -1386,7 +1680,7 @@ function DossierPage({
             <div className="card-head"><span className="card-title"><span className="ic">▤</span>TRUST EVIDENCE</span></div>
             <div className="card-body">
               {(!dossier || dossier.trust.length === 0) && <p className="empty-state">No trust update events have been emitted for this agent.</p>}
-              {dossier?.trust.map((item, index) => <div className="point" key={`trust-${index}`}>{JSON.stringify(item.payload)}</div>)}
+              {dossier?.trust.map((item, index) => <div className="point" key={`trust-${index}`}>{readableProjection(asRecord(item.payload) ?? item)}</div>)}
             </div>
           </div>
         </div>
@@ -1394,6 +1688,159 @@ function DossierPage({
     </section>
   );
 
+}
+
+function SpecialistExecutionCard({ cockpit }: { cockpit: RunCockpit }) {
+  const execution = cockpit.specialist_execution;
+  if (!execution) return null;
+
+  const readinessLabel = execution.development_readiness.replaceAll("_", " ").toUpperCase();
+  return (
+    <div className="card specialist-execution" data-testid="specialist-execution">
+      <div className="card-head">
+        <span className="card-title"><span className="ic">⌘</span>FIXED SPECIALIST EXECUTION</span>
+        <span className="right"><span className={`ver readiness-${execution.development_readiness}`}>{readinessLabel}</span></span>
+      </div>
+      <div className="card-body">
+        {execution.selection_rationale && <p className="specialist-rationale">{execution.selection_rationale}</p>}
+        {execution.correction_count > 0 && (
+          <p className="specialist-correction">{execution.correction_count} rejected selection attempt(s) remain visible.</p>
+        )}
+        {execution.blockers.map((blocker, index) => (
+          <div className="failure-banner" key={`${blocker}-${index}`}>{blocker}</div>
+        ))}
+        <div className="specialist-grid">
+          {execution.assignments.map((assignment) => (
+            <article className={`specialist-node specialist-${assignment.status}`} key={assignment.assignment_id}>
+              <div className="specialist-node-head">
+                <div>
+                  <strong>{assignment.template_id.replaceAll("_", " ")}</strong>
+                  <span>template v{assignment.template_version}</span>
+                </div>
+                <span className="pillstat progress">{assignment.status.toUpperCase()}</span>
+              </div>
+              <p>{assignment.objective}</p>
+              {assignment.depends_on.length > 0 && (
+                <div className="specialist-dependency">WAITS FOR → prior specialist work</div>
+              )}
+              <div className="specialist-meta">
+                <span>Sandbox: <b>{assignment.sandbox_status}</b></span>
+                <span>Specialist: <b>{assignment.agent_id ? "assigned" : "not materialized"}</b></span>
+              </div>
+              <div className="specialist-bundle">
+                <small>CAPABILITIES</small>
+                <div>{assignment.capabilities.map((item) => <span className="badge" key={item}>{item}</span>)}</div>
+                <details className="ledger-details"><summary>Fixed tools and verified skills</summary><p>{assignment.tool_ids.length} predefined tool{assignment.tool_ids.length === 1 ? "" : "s"} and {assignment.skills.length} versioned skill{assignment.skills.length === 1 ? "" : "s"} are attached to this template.</p></details>
+              </div>
+              {assignment.artifacts.length > 0 && (
+                <div className="specialist-artifacts">
+                  <small>ARTIFACTS</small>
+                  {assignment.artifacts.map((artifact) => (
+                    <div key={artifact.path}>
+                      <span>Recorded artifact</span>
+                      <span>{artifact.status} · validation {artifact.validation_status}</span>
+                      {artifact.view_url && (
+                        <a href="#artifacts">
+                          Open artifact
+                        </a>
+                      )}
+                      <details className="ledger-details"><summary>Technical artifact detail</summary><p>{artifact.path}</p></details>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {assignment.blocker && <div className="failure-banner">{assignment.blocker}</div>}
+            </article>
+          ))}
+        </div>
+        <p className="hint">Development readiness only. This view does not claim benchmark superiority.</p>
+      </div>
+    </div>
+  );
+}
+
+function ConversationTurnCard({ event, index, agents, opinion }: { event: SocietyEvent; index: number; agents: Agent[]; opinion: SocietyEvent | null }) {
+  const actor = event.actor ?? asString(event.payload.agent_id) ?? `office-${index + 1}`;
+  const agent = agents.find((item) => item.id === actor);
+  const isClarification = event.type === "user_clarification_requested" || event.type === "user_clarification_answered";
+  const says = asString(event.payload.answer) ?? asString(event.payload.clarification) ?? asString(event.payload.question) ?? asString(event.payload.says) ?? event.message;
+  const respondsTo = asString(event.payload.responds_to);
+  const quote = asString(event.payload.quote_from_prior);
+  const question = asString(event.payload.question_for_next);
+  const reasoning = opinion ? asString(opinion.payload.unique_contribution) ?? asString(opinion.payload.interpretation) : null;
+  return <div className={`turn direct conversation-turn${respondsTo ? " has-parent" : ""}`}>
+    <div className="turn-top">
+      <span className={`orb ${officeForIndex(index)}`}></span>
+      <span className="name">{isClarification ? (event.type === "user_clarification_answered" ? "You" : "Society") : displayIdentity(actor, agents, "Society member").split(" — ")[0]}</span>
+      <span className="role">{isClarification ? (event.type === "user_clarification_requested" ? "Clarification requested" : "Clarification answered") : agent?.role ?? "Agent"}</span>
+      <span className="ttag direct">{isClarification ? "CLARIFICATION" : `TURN ${String(event.payload.turn_index ?? index + 1)}`}</span>
+      <span className="time">{new Date(event.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+    </div>
+    <div className="tx">{says}</div>
+    {respondsTo && <div className="ledger-link">↳ Responding to <b>{respondsTo}</b>{quote ? `: “${quote}”` : ""}</div>}
+    {question && <div className="ledger-link next">Next question: {question}</div>}
+    {reasoning && <details className="ledger-details"><summary>Reasoning and acceptance context</summary><p>{reasoning}</p></details>}
+  </div>;
+}
+
+function LedgerSystemCard({ event }: { event: SocietyEvent }) {
+  const payload = event.payload;
+  const time = new Date(event.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (event.type === "readiness_vote_cast") {
+    const ready = asBoolean(payload.ready);
+    return <div className={`ledger-card readiness ${ready ? "ready" : "blocked"}`}><b>{event.actor ?? asString(payload.agent_id) ?? "Agent"}</b><span>{ready ? "READY" : "NOT READY"}</span><p>{asString(payload.reason) ?? "No reason recorded."}</p><small>{time}</small></div>;
+  }
+  if (event.type === "readiness_vote_tallied") {
+    return <div className="ledger-card decision"><b>READINESS GATE</b><p>{event.message}</p><small>{time}</small></div>;
+  }
+  if (event.type === "leader_election_started" || event.type === "leader_elected") {
+    return <div className="ledger-card decision"><b>{event.type === "leader_elected" ? "LEADER ELECTED" : "LEADER ELECTION"}</b><p>{event.type === "leader_elected" ? `${event.actor ?? asString(payload.leader_id) ?? "A leader"} now coordinates this run.` : event.message}</p><small>{time}</small></div>;
+  }
+  if (event.type === "agent_endorsed_peer" || event.type === "agent_deferred_ownership") {
+    const target = asString(payload.target_agent_id) ?? asString(payload.deferred_to) ?? asString(payload.leader_id);
+    return <div className="ledger-card endorsement"><b>{event.actor ?? "Agent"}</b><p>{event.type === "agent_endorsed_peer" ? "endorsed and deferred ownership to" : "deferred ownership to"} {target ?? "the elected leader"}.</p><small>{time}</small></div>;
+  }
+  if (event.type === "specialist_selection_proposed") {
+    const assignments = Array.isArray(payload.assignments) ? payload.assignments : [];
+    return <div className="ledger-card specialist"><b>FIXED SPECIALIST PLAN PROPOSED</b><p>{asString(payload.selection_rationale) ?? event.message}</p>{assignments.length > 0 && <ul>{assignments.map((item, index) => { const assignment = asRecord(item); const dependencies = asStringArray(assignment?.depends_on); return <li key={asString(assignment?.assignment_id) ?? index}>{asString(assignment?.assignment_id) ?? "assignment"}: {asString(assignment?.template_id) ?? "specialist"}{dependencies.length > 0 ? ` · depends on ${dependencies.join(", ")}` : ""}</li>; })}</ul>}<small>{time}</small></div>;
+  }
+  if (event.type === "specialist_selection_rejected") {
+    const blockers = Array.isArray(payload.blockers) ? payload.blockers : [];
+    return <div className="ledger-card specialist rejected"><b>PLAN REJECTED — CORRECTION REQUIRED</b>{blockers.map((item, index) => { const blocker = asRecord(item); return <p key={index}><code>{asString(blocker?.code) ?? "policy_blocker"}</code> · {asString(blocker?.assignment_id) ?? "selection"}: {asString(blocker?.message) ?? "No detail recorded."}</p>; })}<small>{time}</small></div>;
+  }
+  if (event.type === "run_failed" || event.type === "task_failed") {
+    return <div className="ledger-card terminal"><b>RUN FAILED</b><p>{asString(payload.blocking_reason) ?? asString(payload.error) ?? event.message}</p><small>Phase: {asString(payload.phase) ?? "not recorded"} · {asString(payload.blocker_category) ?? "unclassified"} · {time}</small></div>;
+  }
+  if (event.type === "acceptance_evidence_evaluated") {
+    const requiredPassed = asBoolean(payload.required_passed);
+    const optionalFailures = asStringArray(payload.optional_failures);
+    return <div className={`ledger-card terminal ${requiredPassed ? "passed" : ""}`}>
+      <b>AUTHORITATIVE RUNTIME VERDICT</b>
+      <p>{requiredPassed
+        ? "Required delivery evidence passed: the artifact was exported, independently validated, and every selected sandbox closed. Earlier agent proposals are provisional opinions, not the runtime verdict."
+        : "Required delivery evidence did not pass. Review the unresolved requirements before accepting the run."}</p>
+      {optionalFailures.length > 0 && <small>Optional demo-proof gaps: {optionalFailures.join(", ")} · {time}</small>}
+      {optionalFailures.length === 0 && <small>{time}</small>}
+    </div>;
+  }
+  const executionLabels: Record<string, string> = {
+    specialist_invocation_started: "Workspace started",
+    work_node_started: "Workspace started",
+    workspace_file_written: "File written",
+    file_written: "File written",
+    desktop_rendered: "Desktop rendered",
+    mobile_rendered: "Mobile rendered",
+    artifact_exported: "Artifact exported",
+    artifact_validated: "Independent validation",
+    local_independent_validation_reported: "Independent validation",
+    composition_assignment_cleanup_completed: "Environments closed",
+    composition_assignment_cleanup_warning: "Environment cleanup warning"
+  };
+  const executionLabel = executionLabels[event.type];
+  if (executionLabel) {
+    return <div className="ledger-card"><b>{executionLabel.toUpperCase()}</b><p>{event.message || "Recorded by the execution event stream."}</p><small>{time}</small></div>;
+  }
+  return <details className="ledger-audit-row"><summary>{humanEventLabel(event.type)}</summary><p>{event.message || "Recorded technical event."} · {time}</p></details>;
 }
 
 function LiveRunPage({
@@ -1405,8 +1852,6 @@ function LiveRunPage({
   events,
   agents,
   error,
-  clarificationAnswer,
-  setClarificationAnswer,
   selectedAgent,
   setSelectedAgent,
   agentMemory,
@@ -1414,7 +1859,6 @@ function LiveRunPage({
   setOpenExplainer,
   onSubmit,
   onReplay,
-  onAnswerClarification,
   isSubmitting
 }: {
   prompt: string;
@@ -1425,8 +1869,6 @@ function LiveRunPage({
   events: SocietyEvent[];
   agents: Agent[];
   error: string | null;
-  clarificationAnswer: string;
-  setClarificationAnswer: (v: string) => void;
   selectedAgent: string | null;
   setSelectedAgent: (v: string | null) => void;
   agentMemory: AgentMemory[];
@@ -1434,29 +1876,76 @@ function LiveRunPage({
   setOpenExplainer: (id: string | null) => void;
   onSubmit: (e: FormEvent) => void;
   onReplay: (id: string) => void;
-  onAnswerClarification: (e: FormEvent) => void;
   isSubmitting: boolean;
 }) {
   const [heartbeatNow, setHeartbeatNow] = useState(Date.now());
   const displayAgents = agents;
   const lastActor = events.length > 0 ? (events[events.length - 1].actor ?? asString(events[events.length - 1].payload.agent_id) ?? null) : null;
   const typedEventTypes = new Set([
-    "conversation_turn",
     "agent_position_stated",
     "agent_objection_registered",
     "agent_changed_mind",
-    "agent_goal_opinion",
-    "private_note_published"
+    "targeted_question_answered",
+    "artifact_section_critiqued",
+    "shared_artifact_revised"
   ]);
-  const typedEvents = events.filter((event) => typedEventTypes.has(event.type));
+  const opinionByAgentAndRound = useMemo(() => new Map(
+    events.filter((event) => event.type === "agent_goal_opinion").map((event) => [
+      `${event.actor ?? asString(event.payload.agent_id) ?? "unknown"}:${String(event.payload.round ?? "")}`,
+      event
+    ])
+  ), [events]);
   const systemEventTypes = new Set([
+    "conversation_turn",
+    "user_clarification_requested",
+    "user_clarification_answered",
+    "readiness_vote_cast",
     "leader_elected",
     "leader_election_started",
+    "agent_endorsed_peer",
+    "agent_deferred_ownership",
     "readiness_vote_tallied",
     "working_brief_finalized",
-    "subtasks_assigned_from_brief"
+    "subtasks_assigned_from_brief",
+    "delegation_assigned",
+    "solution_selected",
+    "meeting_recap",
+    "specialist_selection_proposed",
+    "specialist_selection_rejected",
+    "specialist_selection_accepted",
+    "specialist_invocation_approved",
+    "specialist_invocation_started",
+    "workspace_file_written",
+    "file_written",
+    "desktop_rendered",
+    "mobile_rendered",
+    "artifact_exported",
+    "local_independent_validation_reported",
+    "composition_assignment_materialized",
+    "work_node_started",
+    "work_node_blocked",
+    "work_node_failed",
+    "work_node_retry_scheduled",
+    "work_node_canceled",
+    "work_node_completed",
+    "composition_assignment_cleanup_completed",
+    "composition_assignment_cleanup_warning",
+    "artifact_validated",
+    "acceptance_evidence_evaluated",
+    "run_failed",
+    "task_failed"
   ]);
-  const systemEvents = events.filter((event) => systemEventTypes.has(event.type));
+  const ledgerEvents = useMemo(() => events
+    .filter((event) => {
+      if (!(typedEventTypes.has(event.type) || systemEventTypes.has(event.type))) return false;
+      if (event.type === "task_failed" && events.some((item) => item.type === "run_failed")) return false;
+      // A peer endorsement and the matching ownership-defer event record the
+      // same leadership decision. Keep one concise ledger row rather than
+      // presenting it as two user-visible endorsements.
+      if (event.type === "agent_deferred_ownership" && events.some((item) => item.type === "agent_endorsed_peer" && item.actor === event.actor)) return false;
+      return true;
+    })
+    .sort((a, b) => (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0)), [events]);
 
   const latestWorkingBrief = useMemo(() => (
     events.findLast((event) => event.type === "working_brief_finalized")?.payload ?? null
@@ -1464,14 +1953,27 @@ function LiveRunPage({
   const latestAssignments = useMemo(() => (
     events.findLast((event) => event.type === "subtasks_assigned_from_brief")?.payload ?? null
   ), [events]);
-  const latestClarificationRequest = useMemo(() => (
-    events.findLast((event) => event.type === "user_clarification_requested")?.payload ?? null
-  ), [events]);
+  const currentUnderstanding = useMemo(() => {
+    const briefSummary = asString(latestWorkingBrief?.agreed_scope) ?? asString(latestWorkingBrief?.summary);
+    const source = briefSummary ?? task?.prompt ?? null;
+    if (!source) return null;
+    return source.length > 240 ? `${source.slice(0, 237).trimEnd()}…` : source;
+  }, [latestWorkingBrief, task?.prompt]);
+  const replayTasks = useMemo(() => {
+    const available = tasks.filter((item) => item.id !== task?.id);
+    const recent = available.slice(0, 5);
+    // A hard restart can leave the newest runs interrupted. Keep proven outcomes
+    // visible beside recent history so a reviewer can inspect real completed work.
+    const completed = available
+      .filter((item) => isCompletedStatus(item.status) && !recent.some((candidate) => candidate.id === item.id))
+      .slice(0, 3);
+    return [...recent, ...completed];
+  }, [task?.id, tasks]);
 
   const timelineEvents = useMemo(() => events.filter(isTimelineEvent), [events]);
   const currentPhase = cockpit?.current_phase && phaseOrder.some((item) => item.key === cockpit.current_phase)
     ? cockpit.current_phase as PhaseKey
-    : task?.status === "complete" || task?.status === "failed"
+    : isTerminalStatus(task?.status)
     ? "final_answer"
     : timelineEvents.length > 0
       ? phaseOf(timelineEvents[timelineEvents.length - 1].type, timelineEvents[timelineEvents.length - 1].payload)
@@ -1483,6 +1985,12 @@ function LiveRunPage({
 
   const selectedAgentName = agents.find((agent) => agent.id === selectedAgent)?.name;
   const isRunActive = task?.status === "queued" || task?.status === "running";
+  // A paused run can have objection events before the cockpit has summarized
+  // its blocker list; do not render a misleading zero in that interval.
+  const activeBlockerCount = Math.max(
+    cockpit?.blockers.length ?? 0,
+    events.filter((event) => event.type === "agent_objection_registered").length
+  );
   const lastEventTime = events.length > 0 ? Date.parse(events[events.length - 1].created_at) : null;
   const secondsSinceLastEvent = lastEventTime ? Math.max(0, Math.round((heartbeatNow - lastEventTime) / 1000)) : null;
   const activityLabel = !task
@@ -1494,10 +2002,16 @@ function LiveRunPage({
           ? "Still working. The backend may be waiting on an LLM/tool response."
           : "Live events are flowing from the society."
         : task.status === "waiting_for_user"
-          ? "The society is waiting for clarification."
+          ? "This retained run paused before autonomous completion."
+          : task.status === "interrupted"
+            ? "Run interrupted. The society is no longer active."
+          : task.status === "remediation"
+            ? "Run ended in remediation. Review the recorded gaps before starting a new mission."
           : task.status === "complete"
             ? "Run complete."
-            : "Run failed. See the failure details below.";
+            : task.status === "complete_with_warnings"
+              ? "Run complete with warnings."
+              : "Run failed. See the failure details below.";
 
   useEffect(() => {
     if (!isRunActive) return;
@@ -1505,32 +2019,77 @@ function LiveRunPage({
     return () => window.clearInterval(timer);
   }, [isRunActive]);
 
+  const liveTitle = !task
+    ? "Ready for a mission."
+    : task.status === "queued"
+      ? "Society is convening."
+      : task.status === "running"
+        ? currentPhaseConfig?.label ?? "Society at work."
+        : task.status === "waiting_for_user"
+          ? "Retained run paused."
+          : task.status === "interrupted"
+            ? "Run interrupted."
+          : task.status === "remediation"
+            ? "Remediation required."
+          : task.status === "complete"
+            ? "Run complete."
+            : task.status === "complete_with_warnings"
+              ? "Run complete with warnings."
+              : "Run did not complete.";
+
+  const nextActionHint = task?.status === "waiting_for_user"
+    ? "This retained run paused for clarification. New missions proceed autonomously and surface irreducible blockers as terminal outcomes."
+    : isCompletedStatus(task?.status)
+      ? task?.status === "complete_with_warnings"
+        ? "Review the outcome (with warnings) on the Recap screen."
+        : "Review the outcome on the Recap screen."
+      : task?.status === "failed"
+        ? "Check the failure details or start a new mission from Intake."
+        : task?.status === "interrupted"
+          ? "This retained run was interrupted. Start a new mission from Intake."
+        : task?.status === "remediation"
+          ? "This run requires remediation. Review its evidence, then start a new mission from Intake."
+        : task?.status === "queued"
+          ? "No action needed — the team is being assembled."
+          : null;
+
   return (
     <section className="view">
       <div className="kicker">
         MISSION · <em>{(task?.status ?? "intake").toUpperCase()}{currentPhaseConfig ? ` · ${currentPhaseConfig.label.toUpperCase()}` : ""}</em>
       </div>
-      <h1 className="hero-title">{task?.prompt ?? "Convene the society."}</h1>
+      <h1 className="hero-title">{liveTitle}</h1>
+
       <p className="hero-sub">
-        {latestWorkingBrief
-          ? asString(latestWorkingBrief.summary) ?? "The brief is ratified and work is underway."
+        {task?.status === "waiting_for_user"
+          ? "This retained run paused before autonomous completion."
+          : task?.status === "interrupted"
+            ? "This run was interrupted and is not currently executing."
+          : task?.status === "remediation"
+            ? "This run ended with unresolved evidence or validation gaps and is not currently executing."
+          : task?.status === "failed"
+            ? "This run did not complete. Failure details are shown below when available."
+          : latestWorkingBrief
+            ? asString(latestWorkingBrief.summary) ?? "The brief is ratified and work is underway."
           : task
             ? "The society is convened and deliberating."
             : "Submit a problem to convene the society."}
       </p>
 
-      <form className="composer" onSubmit={onSubmit}>
-        <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe the mission..." />
-        <button type="submit" disabled={isSubmitting || task?.status === "queued" || task?.status === "running"}>
-          <Send size={18} /> {isSubmitting ? "Convening..." : task?.status === "queued" || task?.status === "running" ? "Run in progress" : "Convene society"}
-        </button>
-      </form>
+      {task && <a className="artifact-entry" href="#artifacts">View this run's artifacts →</a>}
 
-      {task?.status === "waiting_for_user" && latestClarificationRequest && (
-        <form className="clarificationPanel" onSubmit={onAnswerClarification}>
-          <p><strong>Clarification needed:</strong> {asString(latestClarificationRequest.question) ?? "The society needs more detail."}</p>
-          <textarea value={clarificationAnswer} onChange={(event) => setClarificationAnswer(event.target.value)} placeholder="Answer the society's blocker..." />
-          <button type="submit" disabled={!clarificationAnswer.trim()}><Send size={18} /> Resume society</button>
+      {nextActionHint && (
+        <div className="next-action-hint" role="status">
+          {nextActionHint}
+        </div>
+      )}
+
+      {!task && (
+        <form className="composer" onSubmit={onSubmit}>
+          <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe the mission..." />
+          <button type="submit" disabled={isSubmitting}>
+            <Send size={18} /> {isSubmitting ? "Convening..." : "Convene society"}
+          </button>
         </form>
       )}
 
@@ -1545,9 +2104,9 @@ function LiveRunPage({
         </div>
       )}
 
-      {cockpit && cockpit.trace_status !== "live" && !cockpit.failure && (
+      {task?.status === "waiting_for_user" && cockpit && cockpit.trace_status !== "live" && !cockpit.failure && (
         <div className="error" style={{ marginBottom: 12 }}>
-          Trace status: {cockpit.trace_status.toUpperCase()}{cockpit.stale_reason ? ` — ${cockpit.stale_reason}` : ""}
+          This retained run is paused. {cockpit.stale_reason ?? "Its historical clarification state is preserved for replay."}
         </div>
       )}
 
@@ -1557,6 +2116,8 @@ function LiveRunPage({
           <div className="card-body"><p>{cockpit.leader_rationale}</p></div>
         </div>
       )}
+
+      {cockpit && <SpecialistExecutionCard cockpit={cockpit} />}
 
       <div className="bignums">
         <div className="bignum">
@@ -1575,48 +2136,58 @@ function LiveRunPage({
         </div>
         <div className="bignum-sep"></div>
         <div className="bignum">
-          <div className="n">{String(cockpit?.blockers.length ?? 0).padStart(2, "0")}</div>
-          <div className="l">Active blockers</div>
+          <div className="n">{String(activeBlockerCount).padStart(2, "0")}</div>
+          <div className="l">Blocking signals</div>
         </div>
       </div>
 
       <div className={`run-heartbeat ${isRunActive ? "active" : ""}`} role="status" aria-live="polite">
         <span className="pulse"></span>
         <span>{activityLabel}</span>
-        {secondsSinceLastEvent !== null && <strong>Last event {secondsSinceLastEvent}s ago</strong>}
+        {secondsSinceLastEvent !== null && <strong>Last event {elapsedLabel(secondsSinceLastEvent)}</strong>}
       </div>
 
       <DotStrip currentPhaseIndex={Math.max(0, currentPhaseIndex)} cockpit={cockpit} />
 
       <div className="sect"><span className="ic">◎</span>THE ROOM</div>
 
+      <div className="competence-roster" aria-label="Active specialist employees">
+        {displayAgents.map((agent) => (
+          <div className="competence-chip" key={agent.id}>
+            <strong>{agent.name}</strong><span>{agent.role}</span>
+            <small>{agent.profile.decision_bias || agent.skills.slice(0, 2).join(" · ")}</small>
+          </div>
+        ))}
+      </div>
+
       <div className="workspace">
         <div>
           <div className="dials" data-explain-title="Stance dials" data-explain-text="Each office's live position. The arc shows stance strength — a firm block draws a nearly full ring, a soft dissent a short one. The dark tick marks when the stance last changed. Hover a dial for its stance history this run.">
             {displayAgents.map((agent, index) => (
-              <OfficeDial agent={agent} index={index} cockpit={cockpit} key={agent.id} />
+              <OfficeDial agent={agent} index={index} cockpit={cockpit} runStatus={task?.status} key={agent.id} />
             ))}
             {displayAgents.length === 0 && <div className="empty-state">No backend agents are available. The room will not use demo offices.</div>}
           </div>
 
-          {lastActor && <p className="floor-note"><b>{lastActor}</b> has the floor</p>}
+          {lastActor && <p className="floor-note"><b>{displayIdentity(lastActor, displayAgents)}</b> has the floor</p>}
 
-          <div className="feed" data-explain-title="Typed turn cards" data-explain-text="Turns are typed by intent — direct, propose, challenge, block, concede — and each type has its own structure: a block turn shows the violated constraint and the condition to lift it; a concede turn shows exactly what changed the mind. Ruled lines record system events.">
+          <div className="feed" data-explain-title="Causal debate ledger" data-explain-text="Only turns that add a claim, challenge an assumption, return evidence, revise an artifact, or make a decision appear here. Routine transport and duplicate meeting messages are collapsed.">
+            <div className="feed-intro"><strong>DEBATE LEDGER</strong><span>Time-ordered · support / propose / challenge / block / revision</span></div>
+            <p className="ledger-subtitle">Exact speech, decisions, blockers, and evidence in time order.</p>
+            {currentUnderstanding && <div className="current-understanding"><span aria-hidden="true">◆</span><span><b>Current understanding</b> · {currentUnderstanding}</span></div>}
             {events.length === 0 && !task && (
-              <div className="empty-state">No task is running yet. Start a run from Intake to populate the room with real events.</div>
+              <div className="empty-state">No task is running yet. Start a run from Intake to populate the room with run updates.</div>
             )}
-            {systemEvents.map((event) => (
-              <div className="t-event" key={event.id}>
-                <span>{event.message} · {new Date(event.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-              </div>
-            ))}
-            {typedEvents.map((event, index) => (
-              <TypedTurn agents={displayAgents} event={event} index={index} key={event.id} />
-            ))}
+            {ledgerEvents.map((event, index) => (event.type === "conversation_turn" || event.type === "user_clarification_requested" || event.type === "user_clarification_answered")
+              ? <ConversationTurnCard agents={displayAgents} event={event} index={index} key={event.id} opinion={opinionByAgentAndRound.get(`${event.actor ?? asString(event.payload.agent_id) ?? "unknown"}:${String(event.payload.round ?? "")}`) ?? null} />
+              : typedEventTypes.has(event.type)
+                ? <TypedTurn agents={displayAgents} event={event} index={index} key={event.id} />
+                : <LedgerSystemCard event={event} key={event.id} />
+            )}
             {task && task.status === "running" && (
               <div className="typing">
                 <span className="orb st" style={{ width: 26, height: 26 }}></span>
-                Society is deliberating. Waiting for the next real event…
+                Society is deliberating. Waiting for the next update…
               </div>
             )}
           </div>
@@ -1626,6 +2197,24 @@ function LiveRunPage({
           <LivingBriefCard brief={latestWorkingBrief as Record<string, unknown> | null} prompt={task?.prompt ?? prompt} />
           <DelegationCard assignments={latestAssignments as Record<string, unknown> | null} />
           <ArtifactsCard events={events} />
+
+          {cockpit?.demo_proof && (
+            <div className={`card side-card ${cockpit.demo_proof.verified ? "" : "proof-incomplete"}`}>
+              <div className="card-head">
+                <span className="card-title"><span className="ic">◈</span>DEMO PROOF</span>
+                <span className="right"><span className="ver">{cockpit.demo_proof.verified ? "VERIFIED" : "GAPS VISIBLE"}</span></span>
+              </div>
+              <div className="card-body proof-list">
+                {Object.entries(cockpit.demo_proof.markers).map(([marker, present]) => (
+                  <div className="drow" key={marker}>
+                    <span>{present ? "✓" : "–"} {marker.replaceAll("_", " ")}</span>
+                    <span className={`pillstat ${present ? "done" : "progress"}`}>{present ? "OBSERVED" : "MISSING"}</span>
+                  </div>
+                ))}
+                {!cockpit.demo_proof.verified && <p className="hint">No completion claim is made for missing or incomplete proof points.</p>}
+              </div>
+            </div>
+          )}
 
           {cockpit && cockpit.participants.length > 0 && (
             <div className="card side-card">
@@ -1641,7 +2230,7 @@ function LiveRunPage({
                   style={{ alignItems: "center" }}
                 >
                   <span className={`orb ${officeForIndex(agents.findIndex((a) => a.id === p.agent_id))}`} style={{ width: 22, height: 22 }}></span>
-                  <strong>{p.agent_id}{p.is_leader ? " ★" : ""}</strong>
+                  <strong>{displayIdentity(p.agent_id, agents)}{p.is_leader ? " ★" : ""}</strong>
                   <span>{p.current_stance}</span>
                 </button>
               ))}
@@ -1652,7 +2241,7 @@ function LiveRunPage({
                     <div className="drow" key={d.subtask_id} style={{ marginBottom: 6 }}>
                       <span className="task">
                         <span className="t">{d.objective}</span>
-                        <span className="o">{d.agent_id}</span>
+                        <span className="o">{displayIdentity(d.agent_id, agents)}</span>
                       </span>
                       <span className={`pillstat ${d.status === "done" || d.status === "complete" ? "done" : "progress"}`}>{d.status.toUpperCase()}</span>
                     </div>
@@ -1671,7 +2260,7 @@ function LiveRunPage({
               {cockpit.tool_usage_summary.slice(-8).map((tool) => (
                 <div className="memory-item" key={tool.source_event_id}>
                   <span className="badge">{tool.tool_name}</span>
-                  <span style={{ fontSize: 10, color: "var(--faint)" }}>{tool.agent_id}</span>
+                  <span style={{ fontSize: 10, color: "var(--faint)" }}>{displayIdentity(tool.agent_id, agents)}</span>
                   {tool.why_used && <p>Why: {tool.why_used}</p>}
                   {tool.result_summary && <p>Result: {tool.result_summary}</p>}
                 </div>
@@ -1683,9 +2272,9 @@ function LiveRunPage({
             <div className="card-head">
               <span className="card-title"><span className="ic">↻</span>REPLAY</span>
             </div>
-            {tasks.slice(0, 8).map((item) => (
+            {replayTasks.map((item) => (
               <button className="task-btn" type="button" key={item.id} onClick={() => onReplay(item.id)}>
-                <span>{item.status}</span>
+                <span>{item.status}<small>{item.created_at ? new Date(item.created_at).toLocaleString() : "Time unavailable"} · {item.id.slice(-8)}</small></span>
                 <strong>{item.prompt}</strong>
               </button>
             ))}
@@ -1741,35 +2330,77 @@ export default function App() {
   const [cockpit, setCockpit] = useState<RunCockpit | null>(null);
   const [review, setReview] = useState<DecisionReview | null>(null);
   const [recap, setRecap] = useState<RunRecap | null>(null);
+  const [artifacts, setArtifacts] = useState<TaskArtifact[]>([]);
+  const [artifactsLoading, setArtifactsLoading] = useState(false);
+  const [artifactsError, setArtifactsError] = useState<string | null>(null);
   const [dossier, setDossier] = useState<AgentDossier | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [agentMemory, setAgentMemory] = useState<AgentMemory[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [clarificationAnswer, setClarificationAnswer] = useState("");
   const [openExplainer, setOpenExplainer] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
     listAgents().then((nextAgents) => {
+      if (cancelled) return;
       setAgents(nextAgents);
       setSelectedAgent((current) => current ?? nextAgents[0]?.id ?? null);
     }).catch(() => {
+      if (cancelled) return;
       setAgents([]);
       setError("Backend is offline or unavailable. Static navigation remains available; no society data is fabricated.");
     });
-    listTasks().then(setTasks).catch(() => setTasks([]));
-    getHealth().then(setHealth).catch(() => setHealth(null));
+    listTasks().then((nextTasks) => {
+      if (cancelled) return;
+      setTasks(nextTasks);
+      // Restore the most recently updated real run after a browser refresh.
+      const latestTask = [...nextTasks].sort((a, b) => (Date.parse(b.updated_at ?? b.created_at ?? "") || 0) - (Date.parse(a.updated_at ?? a.created_at ?? "") || 0))[0] ?? null;
+      setTask((current) => current ?? latestTask);
+      // Hydrate the selected replay explicitly during bootstrap. Relying only
+      // on the task-id effect can miss the state transition while React batches
+      // the initial task list update, leaving a paused run at zero events.
+      if (latestTask) {
+        listTaskEvents(latestTask.id).then((nextEvents) => {
+          if (!cancelled) {
+            setEvents((current) => current.length === 0 ? nextEvents : current);
+          }
+        }).catch(() => undefined);
+      }
+    }).catch((err) => {
+      if (cancelled) return;
+      setError(runErrorMessage(err));
+    });
+    getHealth().then((nextHealth) => {
+      if (!cancelled) setHealth(nextHealth);
+    }).catch(() => {
+      if (!cancelled) setHealth(null);
+    });
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
     if (!selectedAgent) {
       setAgentMemory([]);
+      setDossier(null);
       return;
     }
-    listAgentMemory(selectedAgent).then(setAgentMemory).catch(() => setAgentMemory([]));
-    getAgentDossier(selectedAgent, task?.id ?? null).then(setDossier).catch(() => setDossier(null));
-  }, [selectedAgent, task?.id]);
+    let cancelled = false;
+    listAgentMemory(selectedAgent).then((memory) => {
+      if (!cancelled) setAgentMemory(memory);
+    }).catch(() => {
+      if (!cancelled) setAgentMemory([]);
+    });
+    // Refetch on status transitions so the dossier reflects terminal-state truth
+    // (e.g. waiting_for_user -> running -> failed/complete) rather than going stale.
+    getAgentDossier(selectedAgent, task?.id ?? null).then((nextDossier) => {
+      if (!cancelled) setDossier(nextDossier);
+    }).catch(() => {
+      if (!cancelled) setDossier(null);
+    });
+    return () => { cancelled = true; };
+  }, [selectedAgent, task?.id, task?.status]);
 
   const refreshProjections = useCallback((taskId: string) => {
     Promise.all([
@@ -1798,20 +2429,80 @@ export default function App() {
   }, [task, events.length, refreshProjections]);
 
   useEffect(() => {
+    if (!task) {
+      setArtifacts([]);
+      setArtifactsError(null);
+      setArtifactsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setArtifactsLoading(true);
+    setArtifactsError(null);
+    listTaskArtifacts(task.id).then((nextArtifacts) => {
+      if (!cancelled) setArtifacts(nextArtifacts);
+    }).catch((artifactError: unknown) => {
+      if (!cancelled) {
+        setArtifacts([]);
+        setArtifactsError(artifactError instanceof Error ? artifactError.message : "The artifact record is unavailable.");
+      }
+    }).finally(() => {
+      if (!cancelled) setArtifactsLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [task?.id, events.length]);
+
+  useEffect(() => {
+    if (!task) {
+      setEvents([]);
+      return;
+    }
+    // Server-sent events only cover future activity; hydrate the selected run's
+    // existing record so a refresh preserves the real timeline and projections.
+    listTaskEvents(task.id).then((nextEvents) => {
+      setEvents((current) => {
+        const currentForTask = current.filter((e) => e.task_id === task.id);
+        return mergeEvents(currentForTask, nextEvents);
+      });
+    }).catch(() => {});
+  }, [task?.id]);
+
+  useEffect(() => {
+    if (!task || task.status === "waiting_for_user" || isTerminalStatus(task.status)) return;
+    let cancelled = false;
+    // EventSource starts at subscription time. Re-read the persisted timeline
+    // while a run is active so a slow initial hydration cannot leave the Live
+    // counter and ledger empty despite real events already having been stored.
+    const hydratePersistedTimeline = () => {
+      listTaskEvents(task.id).then((nextEvents) => {
+        if (!cancelled) setEvents((current) => mergeEvents(current, nextEvents));
+      }).catch(() => {});
+    };
+    hydratePersistedTimeline();
+    const timer = window.setInterval(hydratePersistedTimeline, 3_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [task?.id, task?.status]);
+
+  useEffect(() => {
     if (!task) return;
-    if (task.status === "complete" || task.status === "failed") return;
+    if (task.status === "waiting_for_user" || isTerminalStatus(task.status)) return;
     const source = new EventSource(`${API_BASE}/tasks/${task.id}/stream`);
     let terminalEventSeen = false;
+    let disposed = false;
     const appendEvent = (event: SocietyEvent) => {
       setEvents((current) => current.some((item) => item.id === event.id) ? current : [...current, event]);
     };
+    // New event types are recovered via persisted hydration on reconnect, but
+    // should be registered here for immediate SSE delivery without a poll gap.
     const eventTypes = [
       "task_received", "team_formed", "leader_elected", "child_agent_spawned",
       "no_spawn", "agent_negotiated", "proposal_challenged", "proposal_revised",
       "debate_round_completed", "negotiation_closed", "tool_call", "vote_cast",
       "ballots_tallied", "solution_selected", "workflow_checkpoint", "workflow_completed",
       "agno_team_ran", "peer_monitor_report", "learning_recorded", "reputation_updated",
-      "task_metrics", "validation_gate_completed", "team_dissolved", "task_complete", "task_failed", "error",
+      "task_metrics", "validation_gate_completed", "team_dissolved", "task_complete", "task_failed", "task_interrupted", "task_remediation", "error",
       "goal_discussion_started", "conversation_turn", "agent_goal_opinion", "readiness_vote_cast",
       "targeted_question_answered", "readiness_vote_tallied", "working_brief_finalized", "leader_election_started",
       "subtasks_assigned_from_brief", "agent_position_stated", "agent_objection_registered",
@@ -1820,7 +2511,17 @@ export default function App() {
       "agent_joined_coalition", "trust_updated", "meeting_recap",
       "artifact_section_critiqued", "shared_artifact_revised", "personality_drifted",
       "failure_recovery_attempted", "user_clarification_requested",
-      "user_clarification_answered", "society_resumed"
+      "user_clarification_answered", "user_decision_resolved", "society_resumed",
+      "specialist_selection_proposed", "specialist_selection_rejected", "specialist_selection_accepted",
+      "specialist_invocation_approved", "specialist_invocation_started", "composition_assignment_materialized",
+      "work_node_started", "work_node_blocked", "work_node_failed", "work_node_retry_scheduled",
+      "work_node_canceled", "work_node_completed", "artifact_validated",
+      "composition_assignment_cleanup_completed", "composition_assignment_cleanup_warning",
+      "agentbay_start_requested", "agentbay_start_succeeded", "agentbay_start_failed", "agentbay_start_rejected",
+      "agentbay_command_requested", "agentbay_command_succeeded", "agentbay_command_failed", "agentbay_command_rejected",
+      "agentbay_run_code_requested", "agentbay_run_code_succeeded", "agentbay_run_code_failed", "agentbay_run_code_rejected",
+      "agentbay_artifact_export_requested", "agentbay_artifact_exported", "agentbay_artifact_export_failed",
+      "local_independent_validation_reported"
     ];
     for (const type of eventTypes) {
       source.addEventListener(type, (message) => {
@@ -1836,9 +2537,13 @@ export default function App() {
           ) {
             const event = parsed as SocietyEvent;
             appendEvent(event);
-            if (event.type === "task_complete" || event.type === "task_failed") {
+            if (TERMINAL_EVENT_TYPES.has(event.type)) {
               terminalEventSeen = true;
               source.close();
+              void getTask(task.id).then((nextTask) => {
+                setTask((current) => current?.id === task.id ? nextTask : current);
+                setTasks((current) => [nextTask, ...current.filter((item) => item.id !== nextTask.id)]);
+              }).catch(() => undefined).finally(() => refreshProjections(task.id));
             }
           }
         } catch {
@@ -1847,15 +2552,22 @@ export default function App() {
       });
     }
     source.onerror = () => {
-      if (terminalEventSeen) return;
+      // A source from a replayed-away task can emit its close error after cleanup.
+      // It must not overwrite the newly selected run's truthful status.
+      if (terminalEventSeen || disposed) return;
       setError("The live event stream stopped. The task status will keep polling.");
       source.close();
     };
-    return () => source.close();
-  }, [task]);
+    return () => {
+      disposed = true;
+      source.close();
+    };
+    // task?.status is required: waiting_for_user closes the server stream, so
+    // the transition back to running must tear down and reconnect EventSource.
+  }, [task?.id, task?.status]);
 
   useEffect(() => {
-    if (!task || task.status === "waiting_for_user" || task.status === "complete" || task.status === "failed") return;
+    if (!task || task.status === "waiting_for_user" || isTerminalStatus(task.status)) return;
     const timer = window.setInterval(() => {
       getTask(task.id).then((nextTask) => {
         setTask((current) => current?.id === task.id ? nextTask : current);
@@ -1874,6 +2586,10 @@ export default function App() {
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, []);
 
+  useEffect(() => {
+    document.title = page === "intake" ? "Quendom Agent Society" : `Quendom | ${page.charAt(0).toUpperCase() + page.slice(1)}`;
+  }, [page]);
+
   const openTour = useCallback(() => {
     setPage("intake");
     setOpenExplainer("intake-form");
@@ -1881,7 +2597,7 @@ export default function App() {
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (isSubmitting || (task && (task.status === "queued" || task.status === "running"))) return;
+    if (isSubmitting) return;
     const validationError = validateMissionPrompt(prompt);
     if (validationError) {
       setError(validationError);
@@ -1897,18 +2613,16 @@ export default function App() {
     if (!nextTask) return;
     setTask(nextTask);
     setTasks((current) => [nextTask, ...current.filter((item) => item.id !== nextTask.id)]);
+    setCockpit(null);
+    setReview(null);
+    setRecap(null);
+    setError(null);
     refreshProjections(nextTask.id);
     setPage("live");
   }
 
   async function intakeSubmit(combinedPrompt: string) {
-    if (isSubmitting || (task && (task.status === "queued" || task.status === "running"))) return;
-    const validationError = validateMissionPrompt(combinedPrompt);
-    if (validationError) {
-      setError(validationError);
-      setPage("live");
-      return;
-    }
+    if (isSubmitting) return;
     setError(null);
     setEvents([]);
     setPrompt(combinedPrompt);
@@ -1920,6 +2634,10 @@ export default function App() {
     if (!nextTask) return;
     setTask(nextTask);
     setTasks((current) => [nextTask, ...current.filter((item) => item.id !== nextTask.id)]);
+    setCockpit(null);
+    setReview(null);
+    setRecap(null);
+    setError(null);
     refreshProjections(nextTask.id);
     setPage("live");
   }
@@ -1929,24 +2647,16 @@ export default function App() {
     const [nextTask, nextEvents] = await Promise.all([getTask(taskId), listTaskEvents(taskId)]);
     setTask(nextTask);
     setEvents(nextEvents);
-    refreshProjections(taskId);
-  }
-
-  async function answerClarification(event: FormEvent) {
-    event.preventDefault();
-    if (!task || !clarificationAnswer.trim()) return;
+    setCockpit(null);
+    setReview(null);
+    setRecap(null);
     setError(null);
-    const resumedTask = await submitClarification(task.id, clarificationAnswer.trim());
-    setTask(resumedTask);
-    setClarificationAnswer("");
-    const nextEvents = await listTaskEvents(task.id);
-    setEvents(nextEvents);
-    refreshProjections(task.id);
+    refreshProjections(taskId);
   }
 
   return (
     <>
-      <Rail status={task?.status ?? "ready"} health={health} currentPage={page} onNavigate={setPage} onTour={openTour} />
+      <Rail status={page === "intake" ? "ready" : task?.status ?? "ready"} health={health} currentPage={page} onNavigate={setPage} onTour={openTour} />
       <main className="main" onClick={(event) => {
         if (!(event.target as Element).closest(".has-exp")) setOpenExplainer(null);
       }}>
@@ -1954,6 +2664,7 @@ export default function App() {
           {page === "intake" && (
             <IntakePage
               onSubmit={intakeSubmit}
+              error={error}
               openExplainer={openExplainer}
               setOpenExplainer={setOpenExplainer}
             />
@@ -1968,8 +2679,6 @@ export default function App() {
               events={events}
               agents={agents}
               error={error}
-              clarificationAnswer={clarificationAnswer}
-              setClarificationAnswer={setClarificationAnswer}
               selectedAgent={selectedAgent}
               setSelectedAgent={setSelectedAgent}
               agentMemory={agentMemory}
@@ -1977,7 +2686,6 @@ export default function App() {
               setOpenExplainer={setOpenExplainer}
               onSubmit={submit}
               onReplay={replayTask}
-              onAnswerClarification={answerClarification}
               isSubmitting={isSubmitting}
             />
           )}
@@ -1985,7 +2693,6 @@ export default function App() {
             <ReviewPage
               task={task}
               review={review}
-              events={events}
               openExplainer={openExplainer}
               setOpenExplainer={setOpenExplainer}
             />
@@ -1999,6 +2706,9 @@ export default function App() {
               setOpenExplainer={setOpenExplainer}
             />
           )}
+          {page === "artifacts" && (
+            <ArtifactPage task={task} artifacts={artifacts} loading={artifactsLoading} error={artifactsError} />
+          )}
           {page === "dossier" && (
             <DossierPage
               agents={agents}
@@ -2010,6 +2720,8 @@ export default function App() {
               setOpenExplainer={setOpenExplainer}
             />
           )}
+          {page === "benchmark" && <BenchmarkPage />}
+          {page === "architecture" && <ArchitecturePage />}
         </div>
       </main>
 

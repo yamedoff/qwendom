@@ -1,4 +1,5 @@
-export const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+export const API_BASE = import.meta.env.VITE_API_BASE
+  ?? (import.meta.env.DEV ? "http://localhost:8000" : window.location.origin);
 
 export async function responseError(response: Response): Promise<Error> {
   const fallback = `Request failed with status ${response.status}.`;
@@ -60,7 +61,7 @@ export type SocietyEvent = {
 export type TaskRun = {
   id: string;
   prompt: string;
-  status: "queued" | "running" | "waiting_for_user" | "complete" | "failed";
+  status: "queued" | "running" | "waiting_for_user" | "complete" | "complete_with_warnings" | "failed" | "interrupted" | "remediation";
   team_id?: string | null;
   final_answer?: string | null;
   created_at?: string;
@@ -137,6 +138,50 @@ export type ToolUsageProjection = {
   source_event_id: string;
 };
 
+export type SpecialistSkillProjection = {
+  skill_id: string;
+  version: string;
+  sha256: string;
+};
+
+export type SpecialistArtifactProjection = {
+  path: string;
+  artifact_id?: string | null;
+  download_url?: string | null;
+  view_url?: string | null;
+  sha256?: string | null;
+  size_bytes?: number | null;
+  status: string;
+  validation_status: string;
+};
+
+export type SpecialistAssignmentProjection = {
+  assignment_id: string;
+  agent_id?: string | null;
+  template_id: string;
+  template_version: string;
+  objective: string;
+  capabilities: string[];
+  tool_ids: string[];
+  skills: SpecialistSkillProjection[];
+  depends_on: string[];
+  acceptance_requirements: string[];
+  validates_assignment_ids: string[];
+  status: string;
+  sandbox_status: string;
+  artifacts: SpecialistArtifactProjection[];
+  blocker?: string | null;
+};
+
+export type SpecialistExecutionProjection = {
+  strategy: string;
+  selection_rationale?: string | null;
+  correction_count: number;
+  assignments: SpecialistAssignmentProjection[];
+  blockers: string[];
+  development_readiness: string;
+};
+
 export type DelegationProjection = {
   subtask_id: string;
   assigned_by?: string | null;
@@ -156,6 +201,18 @@ export type FailureProjection = {
   missing_evidence: string[];
   system_error?: string | null;
   recoverable: boolean;
+};
+
+export type DemoProofProjection = {
+  verified: boolean;
+  markers: Record<string, boolean>;
+  competency_roles: string[];
+  evidence_subtask_ids: string[];
+  leader_id?: string | null;
+  carried_dissent_count: number;
+  final_artifact_id?: string | null;
+  missing_markers: string[];
+  source_event_id: string;
 };
 
 export type WinnerRationaleProjection = {
@@ -181,10 +238,12 @@ export type RunCockpit = {
   artifacts: ArtifactProjection[];
   delegation_summary: DelegationProjection[];
   tool_usage_summary: ToolUsageProjection[];
+  specialist_execution?: SpecialistExecutionProjection | null;
   trace_status: string;
   generated_at?: string | null;
   stale_reason?: string | null;
   failure?: FailureProjection | null;
+  demo_proof?: DemoProofProjection | null;
   final_answer?: string | null;
   timeline: TimelineCounts;
   evidence_status: EvidenceStatus;
@@ -292,6 +351,23 @@ export type AgentDossier = {
   missing_sources: string[];
 };
 
+/** A durable, task-owned output exposed by the artifact delivery API. */
+export type TaskArtifact = {
+  id: string;
+  filename: string;
+  /** `available` is integrity-verified; missing and integrity_failed are not retrievable. */
+  status?: "available" | "missing" | "integrity_failed" | string | null;
+  relative_path?: string | null;
+  kind?: string | null;
+  media_type?: string | null;
+  size_bytes?: number | null;
+  sha256?: string | null;
+  producer?: string | null;
+  validation_status?: string | null;
+  view_url?: string | null;
+  download_url: string;
+};
+
 export async function getHealth(): Promise<Health> {
   const response = await fetch(`${API_BASE}/health`);
   if (!response.ok) throw await responseError(response);
@@ -362,6 +438,12 @@ export async function getDecisionReview(taskId: string): Promise<DecisionReview>
 
 export async function getRunRecap(taskId: string): Promise<RunRecap> {
   const response = await fetch(`${API_BASE}/tasks/${taskId}/recap`);
+  if (!response.ok) throw await responseError(response);
+  return response.json();
+}
+
+export async function listTaskArtifacts(taskId: string): Promise<TaskArtifact[]> {
+  const response = await fetch(`${API_BASE}/tasks/${taskId}/artifacts`);
   if (!response.ok) throw await responseError(response);
   return response.json();
 }
