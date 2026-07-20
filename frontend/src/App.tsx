@@ -547,7 +547,7 @@ type OfficeCode = typeof officeCodes[number];
 
 const officeForIndex = (index: number): OfficeCode => officeCodes[index % officeCodes.length];
 
-function Rail({ status, health, currentPage, onNavigate, onTour }: { status: string; health: Health | null; currentPage: PageKey; onNavigate: (key: PageKey) => void; onTour: () => void }) {
+function Rail({ status, health, currentPage, onNavigate }: { status: string; health: Health | null; currentPage: PageKey; onNavigate: (key: PageKey) => void }) {
   const navItems: { key: PageKey; label: string }[] = [
     { key: "intake", label: "Intake" },
     { key: "live", label: "Live run" },
@@ -562,7 +562,7 @@ function Rail({ status, health, currentPage, onNavigate, onTour }: { status: str
     <>
       <aside className="rail">
         <div className="glyph"></div>
-        <div className="wordmark">Quendom</div>
+        <div className="wordmark">Qwendom</div>
         <div className="wordsub">WORKING SOCIETY</div>
         <nav className="railnav" aria-label="Screens">
           {navItems.map(({ key, label }) => (
@@ -580,11 +580,10 @@ function Rail({ status, health, currentPage, onNavigate, onTour }: { status: str
         <div className="rail-bottom">
           <span className="rail-live"><span className="pulse"></span>{status.toUpperCase()}</span><br />
           {health ? `${health.provider} · ${health.llm_enabled ? health.model : "fallback"}` : "LOCAL SESSION"}<br />
-          <button className="tourbtn" id="tour" type="button" onClick={onTour}>▸&nbsp;&nbsp;TOUR</button>
         </div>
       </aside>
       <div className="mobilebar">
-        <div><div className="wordmark">Quendom</div></div>
+        <div><div className="wordmark">Qwendom</div></div>
         <span className="rail-live"><span className="pulse"></span>{status.toUpperCase()}</span>
       </div>
     </>
@@ -2587,13 +2586,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    document.title = page === "intake" ? "Quendom Agent Society" : `Quendom | ${page.charAt(0).toUpperCase() + page.slice(1)}`;
+    document.title = page === "intake" ? "Qwendom Agent Society" : `Qwendom | ${page.charAt(0).toUpperCase() + page.slice(1)}`;
   }, [page]);
-
-  const openTour = useCallback(() => {
-    setPage("intake");
-    setOpenExplainer("intake-form");
-  }, [setPage]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -2656,7 +2650,7 @@ export default function App() {
 
   return (
     <>
-      <Rail status={page === "intake" ? "ready" : task?.status ?? "ready"} health={health} currentPage={page} onNavigate={setPage} onTour={openTour} />
+      <Rail status={page === "intake" ? "ready" : task?.status ?? "ready"} health={health} currentPage={page} onNavigate={setPage} />
       <main className="main" onClick={(event) => {
         if (!(event.target as Element).closest(".has-exp")) setOpenExplainer(null);
       }}>

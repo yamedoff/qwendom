@@ -40,8 +40,6 @@ h1,h2,h3{color:var(--ink)}
 .rail-live{display:inline-flex;align-items:center;gap:7px;font-family:var(--sans);font-size:11px;font-weight:700;letter-spacing:.14em;color:var(--ink);background:var(--card);border-radius:999px;padding:6px 12px;box-shadow:var(--shadow-sm);margin-bottom:14px}
 .pulse{width:7px;height:7px;border-radius:50%;background:var(--red);animation:pulse 1.6s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.tourbtn{display:inline-flex;align-items:center;gap:8px;font-family:var(--sans);font-size:11px;font-weight:700;letter-spacing:.12em;color:var(--copper-deep);background:var(--copper-soft);border-radius:999px;padding:7px 14px;margin-top:16px;transition:transform .12s}
-.tourbtn:hover{transform:translateY(-1px)}
 .main{margin-left:216px;padding:0 56px 96px}
 .wrap{max-width:1080px;margin:0 auto}
 .view{padding:64px 0 40px}
@@ -100,7 +98,6 @@ h1,h2,h3{color:var(--ink)}
 .exp-pop{position:absolute;top:38px;right:8px;z-index:40;width:min(300px,86vw);background:var(--pop-bg);color:var(--pop-tx);border-radius:14px;padding:14px 16px 15px;box-shadow:0 18px 44px rgba(40,25,10,.35);display:none;font-size:13px;line-height:1.55}
 .exp-pop b{display:block;font-family:var(--serif);font-size:14px;color:#F6D9BF;margin-bottom:4px}
 .exp-open>.exp-pop{display:block}
-.tour-focus{outline:2px solid var(--copper);outline-offset:5px;border-radius:22px}
 .has-exp>.card-head{padding-right:44px}
 .dials>.exp-btn{top:-34px;right:0}
 .dials>.exp-pop{top:-6px}
