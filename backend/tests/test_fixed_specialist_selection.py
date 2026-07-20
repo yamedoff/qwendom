@@ -27,6 +27,7 @@ from society.specialist_selection import (
     SpecialistSelectionError,
     fixed_template_validation_registry,
 )
+from society.tools.specialists import specialist_discovery_instructions
 
 
 def _all_fixed_tools() -> list[str]:
@@ -113,6 +114,62 @@ def test_fixed_catalog_resolves_exact_role_scoped_skills_without_leakage() -> No
     assert "Independent validation" not in builder.skills[0].content
     assert "Repository implementation" not in validator.skills[0].content
     assert builder.tool_bundle_hash != validator.tool_bundle_hash
+
+
+def test_agno_specialist_discovery_skill_describes_available_media_specialists() -> None:
+    """Readiness guidance must expose discovery without granting media tools."""
+
+    instructions = specialist_discovery_instructions()
+    catalog = FixedSpecialistCoordinator(_all_fixed_tools()).list_specialists()
+    image_creator = next(entry for entry in catalog if entry.template_id == "image_creator")
+
+    assert len(instructions) == 1
+    assert "missing_system_capability" in instructions[0]
+    assert "Only the elected leader may select" in instructions[0]
+    assert image_creator.available is True
+    assert image_creator.description == "Generates, inspects, and publishes durable image artifacts for review."
+    assert set(image_creator.tool_ids) == {"generate_images", "inspect_image", "publish_image"}
+
+    image_bundle = resolve_specialist_bundle("image_creator")
+    assert [(skill.skill_id, skill.version) for skill in image_bundle.skills] == [("image_generation", "1")]
+    assert "generate_images" in image_bundle.skills[0].content
+
+
+def test_image_creator_selection_adds_its_required_provenance_checks_to_validator() -> None:
+    """The leader selects roles; immutable policy supplies validation checks."""
+
+    selection = SelectSpecialistsCall(
+        selection_rationale="Generate one image and validate it independently.",
+        assignments=[
+            SpecialistAssignmentSelection(
+                assignment_id="image",
+                template_id="image_creator",
+                objective="Generate and publish one image.",
+                depends_on=[],
+                owned_artifacts=["launch.png"],
+                acceptance_requirements=["image is published"],
+            ),
+            SpecialistAssignmentSelection(
+                assignment_id="validate",
+                template_id="test_engineer",
+                objective="Validate the generated image.",
+                depends_on=["image"],
+                owned_artifacts=[],
+                acceptance_requirements=["image is published"],
+            ),
+        ],
+    )
+
+    resolved = asyncio.run(
+        FixedSpecialistCoordinator(_all_fixed_tools()).select_specialists(
+            selection,
+            task_summary="Generate one launch image.",
+        )
+    )
+    validator = next(item for item in resolved.plan.assignments if item.id == "validate")
+    assert {"independent_validation", "artifact_collection", "artifact_provenance"}.issubset(
+        validator.acceptance_checks
+    )
 
 
 def test_frontend_browser_delivery_skill_is_versioned_and_keeps_exact_template_tools() -> None:

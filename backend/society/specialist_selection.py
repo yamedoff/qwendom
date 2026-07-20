@@ -557,6 +557,13 @@ class FixedSpecialistCoordinator:
             if validates and "independent_validation" not in acceptance_checks:
                 acceptance_checks.append("independent_validation")
             if validates:
+                validation_registry = fixed_template_validation_registry()
+                for target_id in validates:
+                    producer = selections_by_id[target_id]
+                    producer_registration = validation_registry.get(producer.template_id)
+                    for required_check in getattr(producer_registration, "required_validation_checks", []):
+                        if required_check not in acceptance_checks:
+                            acceptance_checks.append(required_check)
                 for requirement in required_acceptance_requirements:
                     normalized_requirement = str(requirement).strip()
                     if normalized_requirement and normalized_requirement not in acceptance_checks:
