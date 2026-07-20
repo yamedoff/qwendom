@@ -51,19 +51,3 @@ service must allow outbound HTTPS to DashScope/Model Studio and AgentBay;
 Context7 also requires the configured MCP command when research is enabled.
 Expose container port `8000` through an HTTPS listener or reverse proxy and
 configure its health probe as `GET /health`.
-
-## Jury acceptance check
-
-1. `GET /health` reports the intended Qwen model and ready provider preflight.
-2. The root URL loads the React UI over HTTPS.
-3. Submit one bounded jury mission and watch real events arrive.
-4. Confirm the leader selects only fixed specialist templates with the recorded
-   skill and tool bundle.
-5. Confirm the specialist panel shows dependency order, AgentBay lifecycle,
-   sandbox closure, artifacts, hashes, and independent validation.
-6. Use **Open artifact** and verify the response includes
-   `X-Artifact-SHA256`.
-7. Restart the container and confirm prior task events and artifacts remain
-   available from the mounted volume.
-
-Deployment is not proven until these checks pass on the public Alibaba URL.

@@ -68,14 +68,6 @@ still contained 119 licensed installed-package records with the same counts.
 Do not add music or stock media to the final video without recording its source
 and redistribution license here.
 
-## Hackathon-period provenance
-
-The current Git history begins on 2026-07-11, after the hackathon cutoff date
-of 2026-05-26. Every published commit in this repository is therefore
-hackathon-period work. If this repository was copied from earlier private work,
-the public history cannot independently prove that earlier provenance; the
-team representative must disclose any pre-existing source before submission.
-
 ## Final public-release checks
 
 1. Root Apache-2.0 `LICENSE` is present.
