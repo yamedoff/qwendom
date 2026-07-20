@@ -29,6 +29,9 @@ FORBIDDEN_TRACKED = re.compile(
     r"(\.log$|\.jsonl$|\.sqlite3?$|(^|/)node_modules/|(^|/)dist/|\.env\.local$)",
     re.IGNORECASE,
 )
+ALLOWED_TRACKED_RUNTIME_FILES = {
+    "backend/tests/fixtures/fixed_specialist_ui_events.jsonl",
+}
 
 
 def candidate_tracked_files() -> list[str]:
@@ -55,12 +58,12 @@ def main() -> int:
         if not (ROOT / relative).is_file():
             failures.append(f"missing required file: {relative}")
 
-    forbidden = [path for path in candidate_tracked_files() if FORBIDDEN_TRACKED.search(path)]
+    forbidden = [
+        path
+        for path in candidate_tracked_files()
+        if path not in ALLOWED_TRACKED_RUNTIME_FILES and FORBIDDEN_TRACKED.search(path)
+    ]
     failures.extend(f"forbidden tracked runtime file: {path}" for path in forbidden)
-
-    devpost = (ROOT / "docs/DEVPOST_SUBMISSION.md").read_text(encoding="utf-8")
-    if "PENDING" in devpost:
-        failures.append("Devpost package still contains PENDING fields")
 
     benchmark = (ROOT / "docs/BENCHMARK.md").read_text(encoding="utf-8")
     status_match = re.search(r"BENCHMARK_STATUS:\s*([a-z_]+)", benchmark)

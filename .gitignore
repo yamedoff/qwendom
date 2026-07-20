@@ -13,6 +13,7 @@ backend/backend/
 *.jsonl
 !backend/tests/fixtures/fixed_specialist_ui_events.jsonl
 readiness-backend-*.log
+agentbay.log
 WRAP.md
 EVENT_AUDIT.md
 backend/benchmark_results/warmup*/
