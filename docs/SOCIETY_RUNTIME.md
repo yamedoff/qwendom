@@ -34,14 +34,15 @@ Important settings:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `LLM_PROVIDER` | `cerebras` | `cerebras`, `qwen`, or `openrouter` |
+| `LLM_PROVIDER` | `qwen` | `qwen`, `cerebras`, or `openrouter` |
 | `CEREBRAS_API_KEY` | empty | Enables Cerebras-backed agents |
 | `CEREBRAS_MODEL` | `gemma-4-31b` | Cerebras model id |
 | `QWEN_API_KEY` | empty | Enables Qwen/DashScope-backed agents |
 | `QWEN_BASE_URL` | DashScope compatible endpoint | OpenAI-compatible Qwen endpoint |
-| `QWEN_MODEL` | `qwen-plus` | Qwen model id |
+| `QWEN_MODEL` | `qwen3.7-plus` | Qwen submission model id |
 | `OPENROUTER_API_KEY` | empty | Enables OpenRouter-backed agents |
 | `LLM_TIMEOUT_SECONDS` | `60` | Timeout for individual model-backed tool calls |
+| `ALLOW_DETERMINISTIC_NO_KEY` | `false` | Explicitly enables local fallback tasks without a model credential |
 | `FRONTEND_ORIGIN` | `http://localhost:5173` | CORS origin for the React app |
 | `KNOWLEDGE_DIR` | `backend/society/knowledge/data` | Role knowledge root |
 | `AGNO_SQLITE_FILE` | `backend/society/data/agno.sqlite` | Local Agno DB file |
@@ -52,9 +53,10 @@ Important settings:
 | `CONTEXTUAL_TRUST_ENABLED` | `true` | Blends task-class trust into leadership scoring |
 | `ROLE_SPECIFIC_TOOLS_ENABLED` | `true` | Gives each role a distinct primary tool and social support-tool bundle |
 
-If no API key is configured, the app still runs in deterministic no-key mode.
-That mode preserves the same lifecycle shape but uses local fallback behavior
-instead of model calls.
+Without an API key, task submission fails honestly by default. Deterministic
+no-key mode remains available only when `ALLOW_DETERMINISTIC_NO_KEY=true` is
+explicitly set for local development or tests. Never present that mode as Qwen
+submission evidence.
 
 ## Agents
 

@@ -1,0 +1,17 @@
+services:
+  qwendom:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - backend/.env
+    environment:
+      FRONTEND_ORIGIN: http://localhost:8000
+      TEAM_COMPOSITION_EXECUTION_ENABLED: "true"
+      EVENT_STORE_FILE: /app/backend/society/data/events.jsonl
+    volumes:
+      - qwendom-data:/app/backend/society/data
+    restart: unless-stopped
+
+volumes:
+  qwendom-data:
