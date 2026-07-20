@@ -25,6 +25,125 @@ def event(event_type: str, payload: dict | None = None, actor: str | None = None
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_terminal_interruption_projects_consistently_in_cockpit_recap_and_dossier(self) -> None:
+        events = [
+            event("task_received", {"prompt": "Build a feature"}, idx=1),
+            event("task_interrupted", {"phase": "validation", "reason": "process_restart"}, idx=2),
+        ]
+        agent = SocietyAgent(id="builder", name="Builder", role="builder", skills=[])
+
+        cockpit = project_cockpit("task-1", events)
+        self.assertEqual(cockpit.status, "interrupted")
+        self.assertEqual(cockpit.trace_status, "interrupted")
+        self.assertEqual(project_recap("task-1", events).status, "interrupted")
+        self.assertEqual(project_recap("task-1", events).completion_outcome, "interrupted")
+        self.assertEqual(project_dossier(agent, events, [], task_id="task-1").this_run_summary["status"], "interrupted")
+
+    def test_fixed_specialist_execution_projects_skills_graph_artifacts_and_cleanup(self) -> None:
+        events = [
+            event("specialist_selection_rejected", {"blockers": [{"message": "Unknown dependency."}]}, idx=1),
+            event("specialist_selection_accepted", {
+                "selection_rationale": "Builder implementation followed by independent validation.",
+                "assignments": [
+                    {
+                        "assignment_id": "build",
+                        "template_id": "builder",
+                        "template_version": "1",
+                        "objective": "Implement the repair.",
+                        "capabilities": ["implementation", "artifact_export"],
+                        "tool_ids": ["execute_command", "export_artifact"],
+                        "skill_ids": ["repository_implementation"],
+                        "skill_versions": ["1"],
+                        "skill_hashes": ["a" * 64],
+                        "depends_on": [],
+                        "owned_artifacts": ["src/calc.py"],
+                        "acceptance_requirements": ["unit_tests"],
+                        "validates_assignment_ids": [],
+                    },
+                    {
+                        "assignment_id": "validate",
+                        "template_id": "test_engineer",
+                        "template_version": "1",
+                        "objective": "Validate the repair.",
+                        "capabilities": ["independent_validation"],
+                        "tool_ids": ["inspect_artifact", "report_independent_validation"],
+                        "skill_ids": ["independent_validation"],
+                        "skill_versions": ["1"],
+                        "skill_hashes": ["b" * 64],
+                        "depends_on": ["build"],
+                        "owned_artifacts": [],
+                        "acceptance_requirements": ["unit_tests", "independent_validation"],
+                        "validates_assignment_ids": ["build"],
+                    },
+                ],
+            }, actor="architect", idx=2),
+            event("composition_assignment_materialized", {"assignment_id": "build", "id": "assignment-build"}, idx=3),
+            event("work_node_started", {"assignment_id": "build", "node_id": "build"}, idx=4),
+            event("agentbay_start_succeeded", {"assignment_id": "build", "node_id": "build", "handle": "redacted"}, idx=5),
+            event("agentbay_artifact_exported", {
+                "assignment_id": "build",
+                "node_id": "build",
+                "workspace_relative_path": "src/calc.py",
+                "artifact_ref": {
+                    "id": "artifact-calc",
+                    "sha256": "c" * 64,
+                    "size_bytes": 42,
+                    "storage_path": "abc/source_calc.py",
+                },
+            }, idx=6),
+            event("composition_assignment_cleanup_completed", {"assignment_id": "build", "node_id": "build"}, idx=7),
+            event("work_node_completed", {"assignment_id": "build", "node_id": "build"}, idx=8),
+            event("work_node_started", {"assignment_id": "validate", "node_id": "validate"}, idx=9),
+            event("local_independent_validation_reported", {"assignment_id": "validate", "node_id": "validate", "passed": True}, idx=10),
+            event("composition_assignment_cleanup_completed", {"assignment_id": "validate", "node_id": "validate"}, idx=11),
+            event("work_node_completed", {"assignment_id": "validate", "node_id": "validate"}, idx=12),
+        ]
+
+        specialist = project_cockpit("task-1", events).specialist_execution
+
+        self.assertIsNotNone(specialist)
+        assert specialist is not None
+        self.assertEqual(specialist.correction_count, 1)
+        self.assertEqual(specialist.assignments[0].skills[0].skill_id, "repository_implementation")
+        self.assertEqual(specialist.assignments[1].depends_on, ["build"])
+        self.assertEqual(specialist.assignments[0].artifacts[0].status, "exported")
+        self.assertEqual(specialist.assignments[0].artifacts[0].validation_status, "passed")
+        self.assertEqual(specialist.assignments[0].artifacts[0].artifact_id, "artifact-calc")
+        self.assertEqual(specialist.assignments[0].artifacts[0].download_url, "/tasks/task-1/artifacts/artifact-calc")
+        self.assertTrue(all(item.sandbox_status == "closed" for item in specialist.assignments))
+        self.assertEqual(specialist.development_readiness, "development_gate_passed")
+
+    def test_specialist_artifacts_never_project_windows_absolute_paths(self) -> None:
+        """Cockpit keeps workspace-relative names but redacts drive and UNC paths."""
+
+        events = [
+            event("specialist_selection_accepted", {"assignments": [{
+                "assignment_id": "build", "template_id": "builder", "template_version": "1",
+                "objective": "Build safely.", "owned_artifacts": [],
+            }]}, idx=1),
+            event("agentbay_artifact_exported", {
+                "assignment_id": "build", "path": "/workspace/private.py",
+                "artifact_ref": {"id": "artifact-drive", "sha256": "a" * 64},
+            }, idx=2),
+            event("agentbay_artifact_exported", {
+                "assignment_id": "build", "path": "\\\\server\\share\\private.txt",
+                "artifact_ref": {"id": "artifact-unc", "sha256": "b" * 64},
+            }, idx=3),
+            event("agentbay_artifact_exported", {
+                "assignment_id": "build", "workspace_relative_path": "src/public.py",
+                "artifact_ref": {"id": "artifact-relative", "sha256": "c" * 64},
+            }, idx=4),
+        ]
+
+        specialist = project_cockpit("task-1", events).specialist_execution
+
+        self.assertIsNotNone(specialist)
+        assert specialist is not None
+        self.assertEqual(
+            [artifact.path for artifact in specialist.assignments[0].artifacts],
+            ["artifact-drive", "artifact-unc", "src/public.py"],
+        )
+
     def test_completed_run_projects_decision_recap_and_dossier(self) -> None:
         events = [
             event("task_received", {"prompt": "Build a grounded run cockpit"}, idx=1),
@@ -84,6 +203,38 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(cockpit.status, "waiting_for_user")
         self.assertEqual(cockpit.blockers[0].required_action, "Which target user?")
         self.assertIn("team_formed", cockpit.missing_sources)
+
+    def test_demo_proof_projects_only_emitted_run_evidence(self) -> None:
+        """The judge-facing checklist must expose gaps instead of inferring success."""
+
+        events = [
+            event("task_received", {"prompt": "Ship an agent society demo"}, idx=1),
+            event("team_formed", {"team": {"id": "team-1", "member_ids": ["architect", "researcher", "builder", "critic"], "leader_id": "architect", "status": "active"}}, idx=2),
+            event("demo_proof_verified", {
+                "verified": False,
+                "markers": {
+                    "distinct_competencies": True,
+                    "evidence_producing_delegation": True,
+                    "leader_decision": True,
+                    "carried_dissent": False,
+                    "final_artifact": True,
+                },
+                "competency_roles": ["architect", "researcher", "builder", "critic"],
+                "evidence_subtask_ids": ["sub-research"],
+                "leader_id": "architect",
+                "carried_dissent_count": 0,
+                "final_artifact_id": "artifact-final-1",
+                "missing_markers": ["carried_dissent"],
+            }, actor="architect", idx=3),
+        ]
+
+        cockpit = project_cockpit("task-1", events, {"status": "complete"})
+
+        self.assertIsNotNone(cockpit.demo_proof)
+        self.assertFalse(cockpit.demo_proof.verified)
+        self.assertTrue(cockpit.demo_proof.markers["evidence_producing_delegation"])
+        self.assertEqual(cockpit.demo_proof.missing_markers, ["carried_dissent"])
+        self.assertEqual(cockpit.demo_proof.final_artifact_id, "artifact-final-1")
 
     def test_proposal_opinions_populate_from_events(self) -> None:
         events = [
@@ -361,6 +512,65 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(len(review.non_blocking_dissent), 1)
         self.assertIn("Scope could expand", review.non_blocking_dissent)
         self.assertTrue(len(review.unresolved_dissent) >= 2)
+
+    def test_final_synthesis_is_the_only_projected_winner(self) -> None:
+        """Later decision evidence supersedes a provisional tally everywhere."""
+
+        events = [
+            event("agent_proposal_submitted", {"agent_id": "builder", "proposal_id": "build-1", "proposal": "Build it."}, actor="builder", idx=1),
+            event("agent_proposal_submitted", {"agent_id": "researcher", "proposal_id": "research-1", "proposal": "Research it."}, actor="researcher", idx=2),
+            event("ballots_tallied", {"winner": "researcher"}, idx=3),
+            event("winner_selected", {"winner_agent_id": "researcher", "winning_proposal_id": "research-1", "why_won": "Initial tally."}, idx=4),
+            event("leader_synthesis", {
+                "winner_agent_id": "builder", "winning_proposal_id": "build-1",
+                "winning_proposal_summary": "Build it.", "why_won": "Final evidence favored delivery.",
+            }, actor="leader", idx=5),
+        ]
+
+        review = project_review("task-1", events)
+
+        self.assertEqual(review.selected_winner, "builder")
+        self.assertEqual(review.selected_proposal_id, "build-1")
+        self.assertEqual(review.leader_synthesis.winner_agent_id, review.selected_winner)
+
+    def test_verified_validation_clears_only_stale_proof_gap_claims(self) -> None:
+        """Review, Recap, and Dossier use validator evidence over old prose."""
+
+        claims = [
+            "Missing artifact evidence", "Dual viewport validation is missing",
+            "Validation output was truncated", "Accessibility validation is missing",
+        ]
+        events = [
+            event("agentbay_artifact_exported", {"assignment_id": "build", "path": "src/page.html"}, idx=1),
+            event("readiness_vote_tallied", {"blockers": claims}, idx=2),
+            event("agent_objection_registered", {"objection": claims[0], "blocks_execution": True}, actor="critic", idx=3),
+            event("meeting_recap", {"unresolved_dissent": claims}, idx=4),
+            event("local_independent_validation_reported", {
+                "passed": True,
+                "checks": ["Desktop and mobile viewport checks passed", "Accessibility checks passed"],
+            }, idx=5),
+            event("validation_gate_completed", {"passed": False, "failed_checks": [{"check": "artifact", "reason": claims[0]}]}, idx=6),
+            event("validation_gate_completed", {"passed": True, "failed_checks": []}, idx=7),
+            event("acceptance_evidence_evaluated", {"terminal_status": "complete"}, idx=8),
+            event("task_complete", {"answer": "Old proposal prose claimed a blocker."}, idx=9),
+        ]
+        agent = SocietyAgent(
+            id="critic", name="Critic", role="reviewer", skills=[],
+            profile=AgentProfile(default_blockers=claims),
+        )
+
+        cockpit = project_cockpit("task-1", events)
+        review = project_review("task-1", events)
+        recap = project_recap("task-1", events)
+        dossier = project_dossier(agent, events, [], task_id="task-1")
+
+        self.assertEqual(cockpit.blockers, [])
+        self.assertEqual(review.blocking_objections, [])
+        self.assertEqual(review.unresolved_dissent, [])
+        self.assertIn("durable_artifact", [item.type for item in review.supporting_artifacts])
+        self.assertEqual(recap.dissents, [])
+        self.assertEqual(recap.completion_outcome, "complete")
+        self.assertNotIn("default blockers:", " ".join(dossier.behavioral_tendencies))
 
 
 if __name__ == "__main__":

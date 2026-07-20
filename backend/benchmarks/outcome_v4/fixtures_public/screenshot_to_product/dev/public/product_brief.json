@@ -1,0 +1,13 @@
+{
+  "product_name": "Calmer Ops",
+  "copy": {
+    "hero": "Ship calmer incident tooling",
+    "feature": "A compact control plane for repair, rollout, and rollback.",
+    "cta": "Review the launch checklist"
+  },
+  "source_ids": [
+    "COPY-HERO-001",
+    "COPY-FEATURE-002",
+    "COPY-CTA-003"
+  ]
+}

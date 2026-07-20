@@ -1,0 +1,11 @@
+{
+  "viewport_targets": {
+    "desktop": [1440, 900],
+    "mobile": [390, 844]
+  },
+  "required_components": [
+    "hero",
+    "cta_button",
+    "feature_copy"
+  ]
+}
