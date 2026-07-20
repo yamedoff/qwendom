@@ -222,6 +222,29 @@ FIXED_SPECIALIST_TEMPLATES = MappingProxyType({
             requires_independent_validation=False,
         ),
     ),
+    "image_creator": SpecialistTemplate(
+        template_id="image_creator",
+        version="1",
+        role="Image Creator",
+        description="Generates, inspects, and publishes durable image artifacts for review.",
+        capabilities=("image_generation", "image_inspection", "artifact_publishing"),
+        tool_ids=("generate_images", "inspect_image", "publish_image"),
+        required_tool_ids=("generate_images", "inspect_image", "publish_image"),
+        skills=(
+            SpecialistSkillReference(
+                skill_id="image_generation",
+                version="1",
+                sha256="01eca66ac4556a9176b78982f7e1c20127a1f0dc22f7e557097b20b626a4c251",
+            ),
+        ),
+        resource_policy=SpecialistResourcePolicy(),
+        conflict_domains=("image_artifact_generation",),
+        artifact_contract=SpecialistArtifactContract(
+            can_produce=True,
+            can_validate=False,
+            requires_independent_validation=True,
+        ),
+    ),
     "frontend_engineer": SpecialistTemplate(
         template_id="frontend_engineer",
         version="2",

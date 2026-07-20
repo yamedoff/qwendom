@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from agno.run import RunContext
@@ -14,6 +15,26 @@ from ..specialist_selection import (
     SelectSpecialistsCall,
     SpecialistAssignmentSelection,
 )
+
+
+_SPECIALIST_DISCOVERY_SKILL_PATH = (
+    Path(__file__).resolve().parents[1] / "skills" / "specialist_discovery" / "1" / "SKILL.md"
+)
+
+
+def specialist_discovery_instructions() -> list[str]:
+    """Load the repository-owned Agno skill for read-only specialist discovery.
+
+    The skill is intentionally instructions-only: it helps a core society
+    member discover an available specialist, but never grants that member the
+    specialist's tools or authority. Missing skill content is a deployment
+    error rather than a reason to fabricate a catalog.
+    """
+
+    try:
+        return [_SPECIALIST_DISCOVERY_SKILL_PATH.read_text(encoding="utf-8")]
+    except OSError as exc:
+        raise RuntimeError("specialist_discovery_skill_unavailable") from exc
 
 
 @tool(name="list_specialists")

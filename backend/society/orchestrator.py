@@ -101,7 +101,11 @@ from .tools.voting import cast_ballot_tool, tally_ballots_tool
 from .tools.evaluation import record_metric_tool, report_independent_validation_tool
 from .tools.conversation import submit_goal_discussion_tool, cast_readiness_vote_tool
 from .tools.social import publish_private_note_tool, record_private_note_tool, state_position_tool
-from .tools.specialists import list_specialists_tool, select_specialists_tool
+from .tools.specialists import (
+    list_specialists_tool,
+    select_specialists_tool,
+    specialist_discovery_instructions,
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -948,6 +952,7 @@ class SocietyOrchestrator:
             if not self.settings.llm_enabled:
                 raise GovernanceToolError("LLM-backed execution is required; deterministic society mode is disabled.")
             team = self._form_team(task)
+            self._seed_specialist_discovery_catalog(task.id)
             await self._run_governance_workflow(task)
             await self._run_pre_execution_conversation(task, team)
             if self.settings.pre_execution_conversation_enabled and self._state(task.id).get("ready_to_proceed") is not True:
@@ -1832,6 +1837,29 @@ class SocietyOrchestrator:
             event_sink=lambda event_type, payload: self._emit_team_composition_event(task_id, event_type, dict(payload)),
         )
 
+    def _seed_specialist_discovery_catalog(self, task_id: str) -> None:
+        """Persist a truthful, read-only specialist catalog before readiness.
+
+        Readiness happens before specialist selection. Seeding the catalog at
+        mission formation prevents core agents from mistaking their own narrow
+        governance tool bundle for the full society's capability envelope. The
+        catalog is resolved from current provider availability and is reused by
+        the later leader-selection phase; it never grants tools to core agents.
+        """
+
+        runtime = self._create_composition_runtime(task_id)
+        coordinator = FixedSpecialistCoordinator(runtime.available_tool_ids().tool_ids)
+        catalog = coordinator.list_specialists(ListSpecialistsCall())
+        state = self._state(task_id)
+        serialized_catalog = [entry.model_dump(mode="json") for entry in catalog]
+        state["fixed_specialist_catalog"] = serialized_catalog
+        self._emit(
+            task_id,
+            "specialist_catalog_available",
+            "Verified fixed-specialist catalog is available to the readiness team.",
+            payload={"specialists": serialized_catalog},
+        )
+
     def _create_team_composer(self, task_id: str) -> TeamComposer:
         """Create the production typed team composer for one task."""
 
@@ -2451,6 +2479,7 @@ class SocietyOrchestrator:
         state["discussion_round_count"] += 1
         round_num = state["discussion_round_count"]
         prior_blockers = state.get("readiness_tally", {}).get("blockers", [])
+        specialist_catalog = state.get("fixed_specialist_catalog", [])
         self._emit(task.id, "goal_discussion_started", f"Goal discussion round {round_num} started.", payload={"round": round_num, "max_rounds": max_rounds})
         for agent_id in team.member_ids:
             agent = self.agents[agent_id]
@@ -2483,6 +2512,7 @@ class SocietyOrchestrator:
                     f"Prior readiness blockers:\n{blocker_context}\n"
                     f"Conversation so far:\n{transcript}\n"
                     f"Previous speaker to respond to: {previous_agent or 'none'}.\n"
+                    f"Verified fixed-specialist catalog for this mission: {json.dumps(specialist_catalog, sort_keys=True)}\n"
                     "Act like a human teammate in a short planning meeting. "
                     "Do not restate the full task. Do not repeat prior points unless you explicitly challenge or refine them. "
                     "If you agree, say what you add. If you disagree, say what should change. "
@@ -2500,6 +2530,7 @@ class SocietyOrchestrator:
                     "and blocker_remediation. "
                         "Call submit_goal_discussion with your exact agent_id."
                     ),
+                    extra_instructions=specialist_discovery_instructions(),
                 )
             except GovernanceToolError as exc:
                 # Do not turn a transport failure into a fabricated employee
