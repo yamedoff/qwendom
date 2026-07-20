@@ -34,13 +34,10 @@ Important settings:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `LLM_PROVIDER` | `qwen` | `qwen`, `qwen_legacy`, or `qwen_legacy` |
-| `QWEN_LEGACY_API_KEY` | empty | Enables Qwen Legacy-backed agents |
-| `QWEN_LEGACY_MODEL` | `gemma-4-31b` | Qwen Legacy model id |
+| `LLM_PROVIDER` | `qwen` | Must be `qwen` |
 | `QWEN_API_KEY` | empty | Enables Qwen/DashScope-backed agents |
-| `QWEN_BASE_URL` | DashScope compatible endpoint | OpenAI-compatible Qwen endpoint |
+| `QWEN_BASE_URL` | DashScope compatible endpoint | Qwen Cloud endpoint |
 | `QWEN_MODEL` | `qwen3.7-plus` | Qwen submission model id |
-| `QWEN_LEGACY_API_KEY` | empty | Enables Qwen Legacy-backed agents |
 | `LLM_TIMEOUT_SECONDS` | `60` | Timeout for individual model-backed tool calls |
 | `ALLOW_DETERMINISTIC_NO_KEY` | `false` | Explicitly enables local fallback tasks without a model credential |
 | `FRONTEND_ORIGIN` | `http://localhost:5173` | CORS origin for the React app |

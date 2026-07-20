@@ -5,9 +5,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Callable
 
 from agno.agent import Agent
-from agno.models.qwen_legacy import Qwen Legacy
 from agno.models.dashscope import DashScope
-from agno.models.qwen_legacy import Qwen Legacy
 
 from config import Settings
 from .db import get_agno_db
@@ -27,20 +25,9 @@ RESEARCHER_CONTEXT7_INSTRUCTIONS = [
 ]
 
 
-def build_model(settings: Settings) -> Qwen Legacy | DashScope | Qwen Legacy:
-    """Create the native Agno model provider for the active backend."""
+def build_model(settings: Settings) -> DashScope:
+    """Create the Qwen Cloud model used by every production agent."""
 
-    if settings.provider == "qwen_legacy":
-        return Qwen Legacy(
-            id=settings.qwen_legacy_model,
-            api_key=settings.qwen_legacy_api_key,
-        )
-    if settings.provider == "qwen_legacy":
-        return Qwen Legacy(
-            id=settings.qwen_legacy_model,
-            api_key=settings.qwen_legacy_api_key,
-            base_url=settings.qwen_legacy_base_url,
-        )
     return DashScope(
         id=settings.qwen_model,
         api_key=settings.qwen_api_key,
@@ -62,9 +49,8 @@ def build_agno_agent(
 ) -> Agent:
     """Create an Agno agent from a society identity.
 
-    Qwen Legacy uses Agno's native Qwen Legacy provider. Qwen Cloud uses Agno's
-    native DashScope provider. Qwen Legacy uses Agno's native Qwen Legacy
-    provider. Set ``LLM_PROVIDER`` in ``.env`` to switch.
+    Qwen Cloud uses Agno's native DashScope provider. ``LLM_PROVIDER`` is
+    retained as an explicit Qwen-only configuration guard.
     """
 
     instructions = [

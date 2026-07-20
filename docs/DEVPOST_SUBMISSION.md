@@ -32,7 +32,8 @@ DashScope endpoint with `qwen3.7-plus`. The integration includes model
 capability preflight, structured-output recovery, bounded retries with
 `Retry-After`, cancellation handling, and redacted provider errors. The
 Researcher may autonomously choose a budgeted Context7 lookup and records tool
-intent plus result provenance. No Qwen Legacy result is presented as Qwen proof.
+intent plus result provenance. Qwen results are clearly labeled with their
+provider and model metadata.
 
 ## Official benchmark result
 

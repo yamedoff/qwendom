@@ -40,7 +40,6 @@ The direct requirements and their audited installed licenses were:
 |---|---:|---|
 | `agno` | 2.6.19 | Apache-2.0 |
 | `mcp` | 1.28.0 | MIT |
-| `qwen_legacy-cloud-sdk` | 1.67.0 | Apache-2.0 |
 | `fastapi` | 0.129.0 | MIT |
 | `uvicorn` | 0.41.0 | BSD-3-Clause |
 | `pydantic` | 2.12.5 | MIT |

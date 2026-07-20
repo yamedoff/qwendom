@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-Provider = Literal["qwen", "qwen_legacy", "qwen_legacy"]
+Provider = Literal["qwen"]
 
 _DASHSCOPE_INTL_HOST = "dashscope-intl.aliyuncs.com"
 _SINGAPORE_WORKSPACE_SUFFIX = ".ap-southeast-1.maas.aliyuncs.com"
@@ -103,16 +103,6 @@ class Settings(BaseSettings):
         alias="WAN_VIDEO_MODEL",
     )
 
-    qwen_legacy_api_key: str = Field(default="", alias="QWEN_LEGACY_API_KEY")
-    qwen_legacy_base_url: str = Field(
-        default="https://qwen_legacy.ai/api/v1",
-        alias="QWEN_LEGACY_BASE_URL",
-    )
-    qwen_legacy_model: str = Field(default="qwen3.7-plus", alias="QWEN_LEGACY_MODEL")
-
-    qwen_legacy_api_key: str = Field(default="", alias="QWEN_LEGACY_API_KEY")
-    qwen_legacy_model: str = Field(default="gemma-4-31b", alias="QWEN_LEGACY_MODEL")
-
     llm_timeout_seconds: int = Field(default=60, alias="LLM_TIMEOUT_SECONDS")
     provider_max_attempts: int = Field(default=3, alias="PROVIDER_MAX_ATTEMPTS")
     provider_backoff_base_seconds: float = Field(default=1.0, alias="PROVIDER_BACKOFF_BASE_SECONDS")
@@ -173,21 +163,15 @@ class Settings(BaseSettings):
 
     @property
     def active_api_key(self) -> str:
-        if self.provider == "qwen_legacy":
-            return self.qwen_legacy_api_key
-        return self.qwen_legacy_api_key if self.provider == "qwen_legacy" else self.qwen_api_key
+        return self.qwen_api_key
 
     @property
     def active_base_url(self) -> str:
-        if self.provider == "qwen_legacy":
-            return ""
-        return self.qwen_legacy_base_url if self.provider == "qwen_legacy" else self.qwen_base_url
+        return self.qwen_base_url
 
     @property
     def active_model(self) -> str:
-        if self.provider == "qwen_legacy":
-            return self.qwen_legacy_model
-        return self.qwen_legacy_model if self.provider == "qwen_legacy" else self.qwen_model
+        return self.qwen_model
 
     @property
     def llm_enabled(self) -> bool:

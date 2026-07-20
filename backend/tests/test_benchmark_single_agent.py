@@ -531,19 +531,6 @@ class TestEvaluatorIntegration(unittest.TestCase):
 
 class TestProviderGuard(unittest.TestCase):
 
-    def test_non_qwen_provider_rejected_without_factory(self):
-        settings = Settings(
-            LLM_PROVIDER="qwen_legacy",
-            QWEN_LEGACY_API_KEY="test-key",
-        )
-
-        result = asyncio.run(
-            run_single_agent(settings, clock=_fixed_clock)
-        )
-
-        self.assertEqual(result.status, "failed")
-        self.assertIn("qwen", result.error)
-
     def test_wrong_qwen_model_rejected_without_factory(self):
         settings = Settings(
             LLM_PROVIDER="qwen",

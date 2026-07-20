@@ -48,8 +48,8 @@ class CaptureModelUsageTests(unittest.TestCase):
 
     def test_full_metrics_recorded(self) -> None:
         metrics = _FakeMetrics({
-            "model": "Qwen 3.7 Plus",
-            "model_provider": "openai",
+            "model": "qwen3.7-plus",
+            "model_provider": "qwen",
             "input_tokens": 100,
             "output_tokens": 50,
             "total_tokens": 150,
@@ -70,8 +70,8 @@ class CaptureModelUsageTests(unittest.TestCase):
         self.assertEqual(record["task_id"], "task-1")
         self.assertEqual(record["call_kind"], "governance_tool")
         self.assertEqual(record["actor_id"], "architect")
-        self.assertEqual(record["model"], "Qwen 3.7 Plus")
-        self.assertEqual(record["model_provider"], "openai")
+        self.assertEqual(record["model"], "qwen3.7-plus")
+        self.assertEqual(record["model_provider"], "qwen")
         self.assertEqual(record["input_tokens"], 100)
         self.assertEqual(record["output_tokens"], 50)
         self.assertEqual(record["total_tokens"], 150)

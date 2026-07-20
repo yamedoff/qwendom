@@ -17,7 +17,7 @@ layers, and validation flow, see [`docs/SOCIETY_RUNTIME.md`](docs/SOCIETY_RUNTIM
 - A reviewer agent provides a real critique of the selected solution (LLM-powered; summary fallback otherwise).
 - Teams dissolve after completion.
 - Agents update memory and reputation after collaboration.
-- Qwen Cloud can power the Agno agents through the DashScope OpenAI-compatible endpoint.
+- Qwen Cloud powers the Agno agents through the DashScope-compatible endpoint.
 
 ## Run locally
 
@@ -38,14 +38,6 @@ For intentionally model-free local lifecycle testing only, set
 `ALLOW_DETERMINISTIC_NO_KEY=true`. Runs from that mode are visibly
 deterministic and must never be used as Qwen or benchmark evidence.
 
-### Qwen Legacy (default)
-
-```env
-LLM_PROVIDER=qwen_legacy
-QWEN_LEGACY_API_KEY=your_qwen_legacy_key
-QWEN_LEGACY_MODEL=gemma-4-31b
-```
-
 ### Qwen Cloud
 
 ```env
@@ -53,15 +45,6 @@ LLM_PROVIDER=qwen
 QWEN_API_KEY=your_qwen_cloud_key
 QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen3.7-plus
-```
-
-### Qwen Legacy
-
-```env
-LLM_PROVIDER=qwen_legacy
-QWEN_LEGACY_API_KEY=your_qwen_legacy_key
-QWEN_LEGACY_BASE_URL=https://qwen_legacy.ai/api/v1
-QWEN_LEGACY_MODEL=qwen3.7-plus
 ```
 
 Then restart the backend. The `/health` endpoint shows which provider is active and whether the LLM is enabled.

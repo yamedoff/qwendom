@@ -19,9 +19,9 @@ from society.schemas.governance import VoteDecision
 
 def _make_settings(**overrides: object) -> Settings:
     defaults = {
-        "LLM_PROVIDER": "qwen_legacy",
-        "QWEN_LEGACY_API_KEY": "test-key",
-        "QWEN_LEGACY_MODEL": "test-model",
+        "LLM_PROVIDER": "qwen",
+        "QWEN_API_KEY": "test-key",
+        "QWEN_MODEL": "qwen3.7-plus",
         "LLM_TIMEOUT_SECONDS": 10,
         "READINESS_CONCURRENCY": 3,
         "EFFICIENT_SOCIETY_ENABLED": False,
