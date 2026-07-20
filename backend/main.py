@@ -304,7 +304,7 @@ def _schedule_background(factory, *, delay: float = _SCHEDULE_DELAY_SECONDS) -> 
     task.add_done_callback(_on_done)
     return task
 
-app = FastAPI(title="Quendom Agent Society", version="0.1.0")
+app = FastAPI(title="Qwendom Agent Society", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin, "http://localhost:5173", "http://127.0.0.1:5173"],
