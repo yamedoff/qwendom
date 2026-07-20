@@ -1,5 +1,0 @@
-[31;1mParserError: [0m
-[31;1m[36;1mLine |[0m
-[31;1m[36;1m[36;1m   4 | [0m python -c from config import Settings; s=Settings([36;1m)[0m; print('BOOT_SETT .[0m
-[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                   ~[0m
-[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mAn expression was expected after '('.[0m
