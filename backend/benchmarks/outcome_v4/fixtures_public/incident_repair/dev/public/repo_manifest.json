@@ -1,0 +1,8 @@
+{
+  "services": [
+    "api",
+    "worker",
+    "config"
+  ],
+  "rollback_limit_minutes": 15
+}

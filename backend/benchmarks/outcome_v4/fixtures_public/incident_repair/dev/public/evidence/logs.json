@@ -1,0 +1,12 @@
+{
+  "evidence_ids": [
+    "AUTH-LOG-401",
+    "JOB-TRACE-008",
+    "DB-CONFIG-URL"
+  ],
+  "notes": [
+    "support tokens started failing with 401 after a scope check refactor",
+    "duplicate jobs were re-processed after worker retries",
+    "the repository runbook still mentions DATABASE_URL although the service expects DB_URL"
+  ]
+}

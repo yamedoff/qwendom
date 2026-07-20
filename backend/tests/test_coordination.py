@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from society.schemas.coordination import CoordinationSubtaskHint, TeamCoordinationBrief
+from society.schemas.governance import VoteDecision
+from society.models import AgentProfile, SocietyAgent
 
 
 class CoordinationSchemaTests(unittest.TestCase):
@@ -76,6 +80,29 @@ class CoordinationSchemaTests(unittest.TestCase):
         self.assertTrue(hint.blocking_if_missing)
         self.assertEqual(hint.done_criteria, ["All truth fields present"])
 
+    def test_model_generated_prose_is_normalized_without_inventing_a_blocker(self) -> None:
+        brief = TeamCoordinationBrief.model_validate(
+            {
+                "summary": "Verify evidence",
+                "proposed_subtasks": [
+                    {
+                        "agent_id": "researcher",
+                        "subtask": "Map claims",
+                        "done_criteria": "Return valid JSON",
+                        "blocking_if_missing": "None - evidence is available",
+                    }
+                ],
+                "delegation_hints": "Delegate claim verification to the researcher",
+            }
+        )
+
+        self.assertEqual(brief.proposed_subtasks[0].done_criteria, ["Return valid JSON"])
+        self.assertFalse(brief.proposed_subtasks[0].blocking_if_missing)
+        self.assertEqual(
+            brief.delegation_hints,
+            ["Delegate claim verification to the researcher"],
+        )
+
 
 class CoordinationBriefParsingTests(unittest.TestCase):
     def test_parse_coordination_brief_from_json_string(self) -> None:
@@ -102,6 +129,109 @@ class CoordinationBriefParsingTests(unittest.TestCase):
         self.assertEqual(brief_dict["risk_signals"], ["Edge cases untested"])
         self.assertEqual(brief_dict["evidence_gaps"], ["No benchmark data"])
         self.assertEqual(brief_dict["assumptions"], ["Builder can deliver in one pass"])
+
+
+class DemoProofTests(unittest.TestCase):
+    def test_demo_proof_marks_a_real_complete_chain_verified(self) -> None:
+        """Proof derives only from actual state recorded by the orchestration path."""
+
+        from society.orchestrator import SocietyOrchestrator
+
+        state = {
+            "tool_bundles": {
+                "architect": {"role_key": "architect"},
+                "researcher": {"role_key": "researcher"},
+                "builder": {"role_key": "builder"},
+            },
+            "subtasks": [{"id": "sub-research", "evidence_refs": ["context7:agno-team"]}],
+            "leader_synthesis": {
+                "winning_proposal_summary": "Ship the evidence-backed run cockpit.",
+                "carried_dissent": ["critic: keep the evidence caveat in the artifact"],
+            },
+            "final_deliverable": {"selected_artifact_id": "artifact-final-1"},
+        }
+        emitted: list[tuple[str, dict]] = []
+        orchestrator = SocietyOrchestrator.__new__(SocietyOrchestrator)
+        orchestrator._state = lambda _task_id: state
+        orchestrator._emit = lambda _task_id, event_type, _message, **kwargs: emitted.append((event_type, kwargs["payload"]))
+
+        orchestrator._record_demo_proof(
+            SimpleNamespace(id="task-1"),
+            SimpleNamespace(leader_id="architect"),
+        )
+
+        self.assertEqual(emitted[0][0], "demo_proof_verified")
+        self.assertTrue(emitted[0][1]["verified"])
+        self.assertEqual(emitted[0][1]["missing_markers"], [])
+        self.assertEqual(emitted[0][1]["evidence_subtask_ids"], ["sub-research"])
+        self.assertTrue(state["demo_proof"]["markers"]["carried_dissent"])
+
+    def test_qwen_json_tool_arguments_validate_without_an_agno_tools_envelope(self) -> None:
+        """Qwen-compatible standalone JSON remains model-produced, not a fallback vote."""
+
+        from society.orchestrator import _extract_tool_result
+
+        response = SimpleNamespace(content='{"choice":"architect","reason":"best evidence chain","confidence":0.82}')
+        decision = _extract_tool_result(response, "cast_ballot", VoteDecision)
+
+        self.assertEqual(decision.choice, "architect")
+        self.assertEqual(decision.confidence, 0.82)
+
+    def test_prose_is_not_mined_as_a_governance_decision(self) -> None:
+        """The compatibility path still rejects prose wrapped around JSON."""
+
+        from society.orchestrator import _extract_tool_result
+
+        response = SimpleNamespace(content='I vote for this: {"choice":"architect","reason":"best","confidence":0.82}')
+        with self.assertRaises(ValueError):
+            _extract_tool_result(response, "cast_ballot", VoteDecision)
+
+    def test_json_only_retry_instruction_names_the_required_vote_schema(self) -> None:
+        """A provider retry is constrained to the same vote fields as the tool."""
+
+        from society.orchestrator import _json_only_retry_instruction
+
+        instruction = _json_only_retry_instruction("cast_ballot", VoteDecision)
+
+        self.assertIn("return ONLY one complete JSON object", instruction)
+        self.assertIn("choice", instruction)
+        self.assertIn("reason", instruction)
+        self.assertIn("confidence", instruction)
+
+    def test_failed_discussion_call_never_becomes_a_fake_agent_statement(self) -> None:
+        """A provider failure is visible as unavailable, not as employee thought."""
+
+        from society.orchestrator import GovernanceToolError, SocietyOrchestrator
+
+        state = {"discussion_round_count": 0, "goal_discussions": [], "readiness_tally": {"blockers": []}}
+        emitted: list[tuple[str, str, dict]] = []
+        orchestrator = SocietyOrchestrator.__new__(SocietyOrchestrator)
+        orchestrator.agents = {
+            "builder": SocietyAgent(
+                id="builder",
+                name="Lin",
+                role="Implementation Engineer",
+                skills=["delivery"],
+                profile=AgentProfile(),
+            )
+        }
+        orchestrator._state = lambda _task_id: state
+        orchestrator._emit = lambda _task_id, event_type, message, **kwargs: emitted.append((event_type, message, kwargs.get("payload", {})))
+
+        async def unavailable(**_kwargs):
+            raise GovernanceToolError("provider returned no structured response")
+
+        orchestrator._run_governance_tool = unavailable
+        asyncio.run(
+            orchestrator._run_goal_discussion_round(
+                SimpleNamespace(id="task-1", prompt="Ship a truthful demo"),
+                SimpleNamespace(member_ids=["builder"]),
+                max_rounds=1,
+            )
+        )
+
+        self.assertEqual([item[0] for item in emitted], ["goal_discussion_started", "agent_contribution_unavailable"])
+        self.assertNotIn("could not provide a structured tool response", str(emitted))
 
     def test_parse_coordination_brief_falls_back_to_raw_content(self) -> None:
         from society.orchestrator import SocietyOrchestrator

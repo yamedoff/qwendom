@@ -1,0 +1,9 @@
+{
+  "hero_asset": "public/assets/hero-card.png",
+  "hero_dimensions": [
+    256,
+    144
+  ],
+  "hero_format": "png",
+  "hero_sha256": "bb69111fa42e64890df2cf542d200f4f68b3f023bb13e6583af80792666dfccf"
+}

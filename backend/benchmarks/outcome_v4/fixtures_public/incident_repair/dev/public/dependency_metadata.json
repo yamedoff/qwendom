@@ -1,0 +1,12 @@
+{
+  "snapshot": "development-fixture-2026-07",
+  "dependencies": [
+    {
+      "package": "pyyaml",
+      "installed_version": "5.3",
+      "reachable": true,
+      "minimum_remediated_version": "6.0.2",
+      "remediation": "upgrade to the minimum remediated version or a compatible newer release"
+    }
+  ]
+}

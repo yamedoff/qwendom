@@ -1,0 +1,27 @@
+{
+  "scenario_id": "incident_repair",
+  "status": "unsealed",
+  "variants": [
+    {
+      "variant_id": "incident_repair_official_01",
+      "description": "Future official incident variant slot 1",
+      "sealed": false,
+      "fixture_hash": null,
+      "evaluator_hash": null
+    },
+    {
+      "variant_id": "incident_repair_official_02",
+      "description": "Future official incident variant slot 2",
+      "sealed": false,
+      "fixture_hash": null,
+      "evaluator_hash": null
+    },
+    {
+      "variant_id": "incident_repair_official_03",
+      "description": "Future official incident variant slot 3",
+      "sealed": false,
+      "fixture_hash": null,
+      "evaluator_hash": null
+    }
+  ]
+}

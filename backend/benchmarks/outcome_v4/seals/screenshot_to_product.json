@@ -1,0 +1,27 @@
+{
+  "scenario_id": "screenshot_to_product",
+  "status": "unsealed",
+  "variants": [
+    {
+      "variant_id": "screenshot_to_product_official_01",
+      "description": "Future official product variant slot 1",
+      "sealed": false,
+      "fixture_hash": null,
+      "evaluator_hash": null
+    },
+    {
+      "variant_id": "screenshot_to_product_official_02",
+      "description": "Future official product variant slot 2",
+      "sealed": false,
+      "fixture_hash": null,
+      "evaluator_hash": null
+    },
+    {
+      "variant_id": "screenshot_to_product_official_03",
+      "description": "Future official product variant slot 3",
+      "sealed": false,
+      "fixture_hash": null,
+      "evaluator_hash": null
+    }
+  ]
+}
