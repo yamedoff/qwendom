@@ -6,3 +6,5 @@ uvicorn[standard]>=0.30.0
 pydantic>=2.8.0
 pydantic-settings>=2.6.0
 python-dotenv>=1.0.1
+wuying-agentbay-sdk>=0.22.3,<0.23.0
+httpx>=0.28,<0.29

@@ -5,7 +5,34 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+BlockerCategory = Literal[
+    "missing_user_input",
+    "missing_system_capability",
+    "safety_or_policy",
+    "future_work",
+    "risk",
+]
+
+BLOCKING_CATEGORIES: frozenset[str] = frozenset({
+    "missing_user_input",
+    "missing_system_capability",
+    "safety_or_policy",
+})
+
+
+class ReadinessBlocker(BaseModel):
+    """A typed readiness blocker with structured remediation metadata."""
+
+    category: BlockerCategory = Field(description="Typed blocker category")
+    owner: str = Field(default="", description="Agent or role responsible for remediation")
+    phase: str = Field(default="pre_execution", description="Phase where this blocker was raised")
+    remediation: str = Field(default="", description="What must happen to resolve this blocker")
+    reason: str = Field(default="", description="Human-readable explanation of the blocker")
+
+
 class GoalDiscussionStatement(BaseModel):
+    """One planning contribution plus the speaker's readiness decision."""
+
     round: int = Field(ge=1, description="Discussion round number")
     agent_id: str = Field(description="Agent contributing this view")
     responds_to: str | None = Field(default=None, description="Agent id this contribution responds to")
@@ -20,6 +47,12 @@ class GoalDiscussionStatement(BaseModel):
     suggested_scope: str = Field(default="", description="Smallest useful scope to execute")
     question_for_next: str | None = Field(default=None, description="Question or challenge for the next agent")
     spoken_turn: str = Field(default="", description="Short meeting-room phrasing of this contribution")
+    ready: bool = Field(default=True, description="Whether this speaker is ready to proceed after their contribution")
+    critical_blocker: bool = Field(default=False, description="Whether a typed blocker prevents execution")
+    blocker_category: BlockerCategory | None = Field(default=None, description="Typed blocker category when blocked")
+    required_clarification: str | None = Field(default=None, description="User clarification required before execution")
+    blocker_owner: str = Field(default="", description="Role or person responsible for resolving the blocker")
+    blocker_remediation: str = Field(default="", description="Concrete action that resolves the blocker")
 
 
 class ConversationTurn(BaseModel):
@@ -55,15 +88,20 @@ class ReadinessBallot(BaseModel):
     critical_blocker: bool = Field(default=False, description="Whether a critical blocker exists")
     reason: str = Field(default="", description="Why the agent is or is not ready")
     required_clarification: str | None = Field(default=None, description="Clarification needed before proceeding")
+    blocker_category: BlockerCategory | None = Field(default=None, description="Typed blocker category if critical_blocker is true")
+    owner: str = Field(default="", description="Agent or role responsible for remediation")
+    phase: str = Field(default="pre_execution", description="Phase where this blocker was raised")
+    remediation: str = Field(default="", description="What must happen to resolve this blocker")
 
 
 class ReadinessTally(BaseModel):
     attempt: int = Field(ge=1, description="Readiness attempt number")
     ready_count: int = Field(ge=0, description="Number of agents voting ready")
-    not_ready_count: int = Field(ge=0, description="Number of agents voting not ready")
+    not_ready_count: int = Field(ge=0, description="Number of agents not voting ready")
     total: int = Field(ge=0, description="Total ballots cast")
     passed: bool = Field(description="Whether readiness passed the policy threshold")
     blockers: list[str] = Field(default_factory=list, description="Critical blockers preventing readiness")
+    structured_blockers: list[ReadinessBlocker] = Field(default_factory=list, description="Typed blockers with remediation metadata")
 
 
 class WorkingBrief(BaseModel):

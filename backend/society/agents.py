@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import shlex
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Callable
 
 from agno.agent import Agent
 from agno.models.cerebras import Cerebras
@@ -13,13 +12,18 @@ from agno.models.openrouter import OpenRouter
 from config import Settings
 from .db import get_agno_db
 from .knowledge import load_role_knowledge
+from .tools.capabilities import execute_notes_demo_tool
+from .context7_research import build_context7_lookup_tool
 from .models import SocietyAgent
 
 
 RESEARCHER_CONTEXT7_INSTRUCTIONS = [
-    "When the task depends on current library, framework, SDK, CLI, or cloud-service behavior, use the Context7 MCP tools before making technical claims.",
-    "Separate Context7-backed facts from inference, and cite the library or documentation topic you looked up.",
-    "Do not use Context7 for ordinary reasoning when local task context is sufficient.",
+    "Context7 is a permitted evidence source, not a mandatory path. Decide whether local context is sufficient before using it.",
+    "Local context means the prompt, session state, and any supplied knowledge. Do not invent or call unprovided local-search tools.",
+    "If external library documentation is necessary, call context7_lookup with your objective, precise query, and expected evidence.",
+    "The only external evidence tool available in this turn is context7_lookup.",
+    "Separate retrieved facts from inference, preserve source provenance, and never invent citations.",
+    "If evidence is irrelevant or insufficient, refine once or report an honest evidence gap.",
 ]
 
 
@@ -49,6 +53,8 @@ def build_agno_agent(
     settings: Settings,
     tools: list[Any] | None = None,
     tool_choice: Any | None = None,
+    output_schema: type[BaseModel] | None = None,
+    structured_outputs: bool | None = None,
     extra_instructions: list[str] | None = None,
     tool_call_limit: int | None = None,
     session_id: str | None = None,
@@ -97,6 +103,10 @@ def build_agno_agent(
         kwargs["tools"] = tools
     if tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
+    if output_schema is not None:
+        kwargs["output_schema"] = output_schema
+    if structured_outputs is not None:
+        kwargs["structured_outputs"] = structured_outputs
     if tool_call_limit is not None:
         kwargs["tool_call_limit"] = tool_call_limit
 
@@ -116,46 +126,58 @@ def researcher_uses_context7(identity: SocietyAgent, settings: Settings) -> bool
 def role_tool_instructions(identity: SocietyAgent, settings: Settings) -> list[str]:
     """Provide role-specific instructions that match optional role tools."""
 
+    if settings.benchmark_suite_tools_enabled:
+        if settings.benchmark_suite_version == "v3":
+            return [
+                "For benchmark v3, inspect the public security surfaces with the provided read-only tools. "
+                "Cite only record IDs returned by tools and do not invent evidence."
+            ]
+        return [
+            "For benchmark tasks, you may use lookup_record, lookup_dataset, and calculate. "
+            "They expose only public task data and basic arithmetic."
+        ]
     if researcher_uses_context7(identity, settings):
         return RESEARCHER_CONTEXT7_INSTRUCTIONS.copy()
+    if settings.role_specific_tools_enabled and identity.id == "builder":
+        return [
+            "When the task requires an executable collaborative-notes implementation, call execute_notes_demo. "
+            "Never claim files or validation commands ran unless that tool returns executed=true and passed=true."
+        ]
     return []
 
 
 @asynccontextmanager
-async def role_tool_context(identity: SocietyAgent, settings: Settings) -> AsyncIterator[list[Any]]:
+async def role_tool_context(
+    identity: SocietyAgent,
+    settings: Settings,
+    *,
+    on_tool_intent: Callable[[dict[str, Any]], None] | None = None,
+    on_tool_result: Callable[[dict[str, Any]], None] | None = None,
+) -> AsyncIterator[list[Any]]:
     """Open optional role-specific toolkits for a single Agno run.
 
     Agno's MCPTools owns a live MCP client connection, so callers should create
     it around the agent run instead of storing it on long-lived society agents.
     """
 
-    if not researcher_uses_context7(identity, settings):
-        yield []
-        return
-
-    try:
-        from agno.tools.mcp import MCPTools
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-    except ImportError as exc:
-        raise RuntimeError(
-            "Context7 MCP access requires Agno's MCP extras. Install backend dependencies "
-            "from backend/requirements.txt and ensure the 'mcp' package is available."
-        ) from exc
-
-    command_parts = shlex.split(settings.context7_mcp_command)
-    if not command_parts:
-        raise RuntimeError("CONTEXT7_MCP_COMMAND cannot be empty when Context7 MCP is enabled.")
-
-    server_params = StdioServerParameters(
-        command=command_parts[0],
-        args=command_parts[1:],
-    )
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            context7_tools = MCPTools(session=session)
-            await context7_tools.initialize()
-            yield [context7_tools]
+    tools: list[Any] = []
+    if settings.benchmark_suite_tools_enabled:
+        if settings.benchmark_suite_version == "v3":
+            from benchmarks.tools_v3 import SHARED_TOOLS
+            tools.extend(SHARED_TOOLS)
+        else:
+            from benchmarks.tools_v2 import calculate, lookup_dataset, lookup_record
+            tools.extend([lookup_record, lookup_dataset, calculate])
+    if settings.role_specific_tools_enabled and identity.id == "builder":
+        tools.append(execute_notes_demo_tool)
+    if researcher_uses_context7(identity, settings):
+        tools.append(build_context7_lookup_tool(
+            settings,
+            max_calls=settings.context7_max_calls_per_turn,
+            on_intent=on_tool_intent,
+            on_result=on_tool_result,
+        ))
+    yield tools
 
 
 def fallback_contribution(identity: SocietyAgent, prompt: str) -> str:
