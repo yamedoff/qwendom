@@ -19,10 +19,10 @@ REQUIRED_FILES = (
     "LICENSE",
     "CONTRIBUTING.md",
     "SECURITY.md",
+    "docs/ALIBABA_CLOUD_DEPLOYMENT.md",
     "docs/BENCHMARK.md",
-    "docs/DEMO_SCRIPT.md",
-    "docs/DEVPOST_SUBMISSION.md",
     "docs/HACKATHON_ARCHITECTURE.md",
+    "docs/SOCIETY_RUNTIME.md",
     "docs/THIRD_PARTY_NOTICES.md",
 )
 FORBIDDEN_TRACKED = re.compile(

@@ -1,149 +1,68 @@
-# Benchmark Slice 1 — Single-Agent vs Society Reference Task
+# Qwendom benchmark harness
 
-## Purpose
+This package contains the public task definitions, prompt builders, schemas, runners, and deterministic evaluators used to compare a single Qwen agent with the Qwendom society.
 
-A deterministic, no-sandbox, no-LLM evaluation contract for comparing
-incident-response quality between single-agent and society modes on an
-identical reference task.
+The public submission summary and current aggregate are documented in [`docs/BENCHMARK.md`](../../docs/BENCHMARK.md). Large provider-run bundles and internal reports are intentionally not committed.
 
-## Hidden Ground-Truth Boundary
+## Design rules
 
-The ground-truth fixture (`fixtures/ground_truth.py`) is **never** imported
-by the loader or prompt builder.  A model running the benchmark sees only
-the facts, candidate IDs, and constraints from `fixtures/incident_packet.py`.
-The evaluator and test suite are the only consumers of ground truth, ensuring
-that no information leaks into the model-facing prompt.
+1. **Same task, different operating model.** A comparison gives both modes the same mission, evidence packet, model family, output contract, and evaluator. The baseline answers alone; Qwendom may coordinate and iterate.
+2. **No answer leakage.** Model-facing prompt builders import only public fixtures. Ground truth remains evaluator-only.
+3. **Deterministic scoring.** Python checks structured output against the frozen answer key. A second model does not score the answer.
+4. **Governance earns zero direct points.** Calls, agents, discussion, and votes matter only if they improve the scored output.
+5. **Failures stay visible.** Timeouts, malformed outputs, incomplete usage, and failed attempts are recorded rather than silently converted to successful trials.
+6. **Usage remains usage.** Missing token or cost metadata stays unknown; it is never converted to zero.
 
-## No-Sandbox Design
+## Package map
 
-This benchmark requires no sandbox, no Docker container, and no LLM call.
-The evaluator is a pure Python function that compares structured ID sets
-against ground truth.  This makes it deterministic, fast, and trivially
-reproducible across environments.
-
-## Fairness Guarantees
-
-| Guarantee | Mechanism |
+| Area | Purpose |
 |---|---|
-| Identical rubric | `evaluator.evaluate()` accepts a `mode` label but never branches on it |
-| No prompt leakage | `loader.build_prompt()` imports only from `fixtures.incident_packet`; ground truth is a separate module |
-| Exact comparisons | All checks use ID equality, set Jaccard, or ordered-sequence match — never prose keywords |
-| Evidence validation | Every cited fact ID is checked against the public `VALID_FACT_IDS` set |
-| Unsupported-ID penalty | −3 pts per invalid/unsupported fact ID cited |
-| Governance exclusion | `governance_score` is hardcoded to 0; governance fields are never read by the scorer |
-| Score clamping | Final score is `max(0, min(100, raw − penalties))` |
+| `fixtures/` | Public incident evidence and evaluator-only answer keys for the earlier suites |
+| `loader.py`, `loader_v2.py`, `loader_v3.py` | Build model-facing prompts without importing private answers |
+| `evaluator.py`, `evaluator_v2.py`, `evaluator_v3.py` | Deterministic scoring |
+| `single_agent.py` | Run the baseline through the configured Qwen model |
+| `society_adapter.py` | Adapt Qwendom output to the benchmark contract |
+| `runtime.py` | Trial status, raw output, usage, and error schemas |
+| `reporting.py` | Aggregate retained trials without hiding incomplete usage |
+| `run_benchmark*.py` | Suite entry points |
+| `outcome_v4/` | Development scenarios for artifact-producing and reliability evaluation |
 
-## Fixture Separation
+## Evaluation boundary
 
-```
-benchmarks/
-├── fixtures/
-│   ├── incident_packet.py   ← public; fed to the model prompt
-│   └── ground_truth.py      ← private; imported only by evaluator + tests
-├── loader.py                ← builds prompt from incident_packet only
-├── evaluator.py             ← pure scorer; imports ground_truth
-├── comparison.py            ← mode-neutral helpers
-└── README.md
-```
+The reference incident suites expose facts, candidate IDs, requirements, and constraints to the model. Private answer sets are imported only by evaluators and tests.
 
-The ground-truth module is **never** imported by `loader.py`.  A model
-running the benchmark sees only the facts, candidate IDs, and constraints
-from `incident_packet.py`.
+The scorer checks structured requirements such as:
 
-## Rubric (100 points)
+- supported causes and evidence;
+- required actions and order;
+- safety controls;
+- release constraints;
+- requested numeric results; and
+- invalid or unsupported identifiers.
 
-| Category | Points | Method |
-|---|---|---|
-| Root cause — hypothesis ID | 15 | Exact string match |
-| Root cause — evidence | 10 | F1 over required fact-ID set |
-| Actions — set | 15 | Jaccard similarity |
-| Actions — order | 10 | Positional match on filtered sequence |
-| Controls — set | 15 | Jaccard similarity |
-| Evidence — valid IDs | 5 | Ratio of valid to total cited |
-| Evidence — required claims | 10 | Fraction of claims fully supported |
-| Evidence — no unsupported | 5 | Binary: 0 if any invalid ID cited |
-| Constraints — set | 15 | Jaccard similarity |
-| **Penalty** | −3 each | Per invalid fact ID cited |
-| **Governance** | 0 | Excluded from scoring |
+Prose style is not a substitute for a required field or evidence record.
 
-## Running Tests
+## Running evaluator tests
 
-```bash
-python -m pytest backend/tests/test_benchmark_evaluator.py -v
-python -m pytest backend/tests/test_benchmark_single_agent.py -v
+From the repository root:
+
+```powershell
+python -m pytest backend/tests/test_benchmark_evaluator.py -q
+python -m pytest backend/tests/test_benchmark_single_agent.py -q
+python -m pytest backend/tests/test_benchmark_reporting.py -q
 ```
 
-An official comparison requires at least three successful trials per mode.
-One-run warm-ups are reported as `insufficient_data` and must not be presented
-as a final winner. Provider cost remains unknown when DashScope omits pricing
-metadata; the reporter never converts an unknown cost to zero.
+Provider runs require the configured Qwen credentials. Deterministic evaluator tests do not call Qwen or AgentBay.
 
-## Slice 2A — Single-Agent Runner
+## Public-result discipline
 
-### Purpose
+The public repository keeps the methodology and evaluation code, not bulky run reports. A published aggregate must come from retained run artifacts and must state:
 
-An injectable, documented qwen3.7-plus single-agent runner for the
-IncidentDecision benchmark.  The runner constructs an Agno Agent with
-structured output, runs the reference prompt, parses the response, and
-invokes the pure evaluator — all without touching production files.
+- task and suite version;
+- number of trials and failed attempts;
+- model and mode;
+- quality and acceptance results;
+- model calls and token usage; and
+- what the comparison does and does not establish.
 
-### Files
-
-| File | Role |
-|---|---|
-| `runtime.py` | `TrialUsage` (Agno field names) / `TrialResult` Pydantic models, safe `parse_decision`, `extract_metrics` |
-| `single_agent.py` | `run_single_agent` async entry point — awaits `agent.arun(prompt)` with injectable `agent_factory` and `clock` |
-
-### Design Decisions
-
-* **Provider guard** — `run_single_agent` requires `settings.provider == 'qwen'`
-  and `settings.qwen_model == 'qwen3.7-plus'` when no `agent_factory` is
-  injected.  Tests bypass this guard by supplying a fake factory.
-* **Async arun** — The runner awaits `agent.arun(prompt)` directly rather
-  than wrapping a synchronous `Agent.run` in a thread.  Fake agents in tests
-  implement `async def arun` for full coverage without provider calls.
-* **Safe parser** — `parse_decision` accepts `IncidentDecision`, any
-  `BaseModel`, `dict`, or a strict full-JSON `str`.  Embedded-prose mining
-  is explicitly rejected.
-* **Raw output serialization** — `raw_output` is always a `str | None`.
-  When the response content is a `BaseModel` or `dict`, it is serialized to
-  a stable JSON string (`sort_keys=True`).  When it is already a `str`, it
-  is stored verbatim.  A `BaseModel` is never assigned into the `str` field.
-* **Agno metrics** — `extract_metrics` reads `RunMetrics.to_dict()` and maps
-  Agno field names: `input_tokens`, `output_tokens`, `total_tokens`
-  (required for `usage_complete`), plus optional `cache_read_tokens`,
-  `cache_write_tokens`, `reasoning_tokens`, `cost`, `duration`, and
-  `time_to_first_token`.
-* **No tools** — The agent instructions explicitly forbid tools and external
-  evidence because the incident packet is self-contained.
-* **Hard timeout** — `asyncio.wait_for` enforces a wall-clock deadline;
-  both timeout and arbitrary exceptions are preserved in `TrialResult.error`.
-* **Injectable dependencies** — `agent_factory` and `clock` are keyword-only
-  parameters so tests never call a real provider.
-
-### TrialResult Schema
-
-| Field | Type | Description |
-|---|---|---|
-| `trial_id` | `str` | UUID |
-| `mode` | `"single_agent"` | Always single_agent for this runner |
-| `provider` | `str` | e.g. `"qwen"` |
-| `model` | `str` | e.g. `"qwen3.7-plus"` |
-| `task_hash` | `str` | SHA-256 of the task identifier |
-| `prompt_hash` | `str` | SHA-256 of the rendered prompt |
-| `started_at` / `finished_at` | `str` | ISO-8601 UTC timestamps |
-| `wall_duration_s` | `float` | Elapsed seconds |
-| `status` | `"success"` / `"failed"` | Outcome |
-| `raw_output` | `str \| None` | Stable JSON string (BaseModel/dict → `json.dumps`) or verbatim string |
-| `parsed_decision` | `IncidentDecision \| None` | Parsed structured output |
-| `evaluation` | `EvaluationResult \| None` | Pure evaluator result |
-| `usage` | `TrialUsage` | Agno token-level metrics (input/output/total + optional cache/reasoning/cost/duration/ttft) |
-| `error` | `str \| None` | Preserved exception message |
-
-### Incident Scenario
-
-A payment-service deployment (v2.4.1) introduced a connection pooling
-library that allocates 50 connections per pod (up from 10), exhausting the
-database pool and causing cascading timeouts in the api-gateway.  The
-packet contains 25 facts, 3 contradiction pairs, 2 red herrings, and 3
-stakeholder constraints.
+Do not mix provider results with deterministic no-key lifecycle runs or development smoke tests.
