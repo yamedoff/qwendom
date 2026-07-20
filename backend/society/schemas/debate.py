@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ProposalRecord(BaseModel):
@@ -18,6 +19,28 @@ class ProposalRecord(BaseModel):
     target_artifact_id: str | None = None
     supports: list[str] = Field(default_factory=list)
     created_from_phase: str = "debating"
+
+    @field_validator("proposal", mode="before")
+    @classmethod
+    def normalize_structured_proposal(cls, value: object) -> str:
+        """Preserve structured model output as stable text instead of rejecting it."""
+
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, sort_keys=True, default=str)
+        return str(value)
+
+    @field_validator("supports", mode="before")
+    @classmethod
+    def normalize_supports(cls, value: object) -> list[str]:
+        """Normalize common malformed tool arguments without inventing support links."""
+
+        if value is None or isinstance(value, bool):
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        return []
 
 
 ProposalOpinionStance = Literal["support", "oppose", "uncertain", "neutral"]

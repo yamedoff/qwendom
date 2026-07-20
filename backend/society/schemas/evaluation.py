@@ -13,6 +13,16 @@ class MetricRecord(BaseModel):
     created_at: str = ""
 
 
+class IndependentValidationReport(BaseModel):
+    """Non-voting specialist's evidence-based review of a deliverable."""
+
+    passed: bool = Field(description="Whether the supplied evidence supports the deliverable")
+    checked_evidence_ids: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    recommendation: str = Field(default="", description="Bounded corrective action or approval reason")
+
+
 class TaskMetrics(BaseModel):
     """Structured metrics emitted after each completed task."""
 

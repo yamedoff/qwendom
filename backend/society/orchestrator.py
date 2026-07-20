@@ -2,20 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import copy
 import json
 import time
 from collections import Counter
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any, Type, TypeVar
 from uuid import uuid4
 
+from agno.agent import Agent
 from pydantic import BaseModel, ValidationError
 
 from config import Settings, get_settings
-from .agents import build_agno_agent, fallback_contribution, role_tool_context, role_tool_instructions
-from .context7_research import collect_context7_evidence, format_context7_evidence
+from .agents import build_agno_agent, build_model, fallback_contribution, role_tool_context, role_tool_instructions
+from .composition_runtime import CompositionRuntime
+from .provider_runtime import run_provider_call
+from .capability_registry import (
+    default_required_capabilities,
+    find_capable_team_member,
+    get_role_capabilities,
+    resolve_role_key,
+)
 from .db import get_agno_db
+from .error_taxonomy import ErrorCategory, build_attempt_record, classify_error, compute_backoff, is_retryable, make_idempotency_key
 from .memory import EventStore
 from .metrics import MetricsCollector, summarize_task_metrics
 from .models import AgentProfile, SocietyAgent, SocietyEvent, TaskRun, Team, ToolCallPayload, now_iso
@@ -34,7 +43,7 @@ from .schemas.governance import (
     SpawnDecision,
     VoteDecision,
 )
-from .schemas.evaluation import TaskMetrics, MetricRecord
+from .schemas.evaluation import IndependentValidationReport, TaskMetrics, MetricRecord
 from .schemas.artifacts import ArtifactRecord, ArtifactReference, FinalDeliverable
 from .schemas.debate import ChallengeRecord, ProposalOpinionRecord, ProposalRecord, RevisionRecord
 from .schemas.delegation import SubtaskAssignment, SubtaskReport
@@ -44,20 +53,39 @@ from .schemas.conversation import (
     GoalDiscussionStatement,
     MeetingRecap,
     ReadinessBallot,
+    ReadinessBlocker,
     ReadinessTally,
     TargetedQuestionExchange,
     WorkingBrief,
+    BLOCKING_CATEGORIES,
 )
 from .schemas.coordination import CoordinationSubtaskHint, TeamCoordinationBrief
 from .schemas.social import AgentPosition, CollaborationAction, EndorsementRecord, MindChangeRecord, ObjectionRecord, PrivateNote, TrustUpdate
 from .session import initial_session_state
 from .team import build_society_team
+from .team_composer import (
+    AgnoTeamPlanProvider,
+    CompositionContext,
+    TeamComposer,
+    TeamCompositionBlocked,
+    TeamCompositionProviderError,
+    TeamCompositionResult,
+)
+from .specialist_selection import (
+    FixedSpecialistCoordinator,
+    InvokeSpecialistCall,
+    ListSpecialistsCall,
+    ListSpecialistsResult,
+    SelectSpecialistsCall,
+    SpecialistSelectionError,
+)
 from .tools.capabilities import (
     decompose_task_tool,
     implementation_plan_tool,
     memory_lookup_tool,
     memory_write_tool,
     risk_assessment_tool,
+    load_notes_demo_evidence,
 )
 from .workflow import build_governance_workflow, compute_task_metrics, should_skip_phase, get_loop_budget
 from .tools.governance import (
@@ -70,9 +98,10 @@ from .tools.governance import (
 from .tools.delegation import assign_subtask_tool, report_subtask_tool
 from .tools.debate import challenge_tool, propose_tool, record_proposal_opinion_tool, revise_tool
 from .tools.voting import cast_ballot_tool, tally_ballots_tool
-from .tools.evaluation import record_metric_tool
+from .tools.evaluation import record_metric_tool, report_independent_validation_tool
 from .tools.conversation import submit_goal_discussion_tool, cast_readiness_vote_tool
 from .tools.social import publish_private_note_tool, record_private_note_tool, state_position_tool
+from .tools.specialists import list_specialists_tool, select_specialists_tool
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -91,6 +120,268 @@ def _parse_json_response(text: str) -> dict | None:
         return None
 
 
+_NO_MOCK_MARKERS: tuple[str, ...] = (
+    "no mock",
+    "no mocks",
+    "no-mock",
+    "no fabrication",
+    "no-fabrication",
+    "do not fabricate",
+    "do not mock",
+    "don't fabricate",
+    "don't mock",
+    "without mocking",
+    "without fabrication",
+    "no simulated",
+    "no synthetic",
+    "real evidence only",
+    "actual evidence",
+)
+
+
+def _prompt_has_no_mock_constraint(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(marker in lowered for marker in _NO_MOCK_MARKERS)
+
+
+_MOCK_RECOMMENDATION_MARKERS: tuple[str, ...] = (
+    "mock",
+    "simulate",
+    "fake",
+    "synthetic",
+    "offline",
+    "stub",
+    "placeholder",
+)
+
+
+def _strip_mock_recommendations(text: str) -> str:
+    lines = text.split("\n")
+    kept: list[str] = []
+    for line in lines:
+        lowered = line.lower().strip()
+        if not lowered.startswith(("do not ", "don't ", "never ", "no ")) and any(marker in lowered for marker in _MOCK_RECOMMENDATION_MARKERS) and any(
+            verb in lowered for verb in ("recommend", "suggest", "use", "try", "prefer", "could")
+        ):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip() or text
+
+
+def _contains_mock_recommendation(text: str) -> bool:
+    """Return whether the answer recommends simulated behavior as a deliverable."""
+
+    for line in text.splitlines():
+        lowered = line.lower()
+        if any(marker in lowered for marker in ("mock", "simulate", "fake", "synthetic", "stub")) and any(
+            verb in lowered for verb in ("recommend", "suggest", "use", "try", "prefer", "could", "can")
+        ):
+            return True
+    return False
+
+
+def _prompt_requires_implementation(prompt: str) -> bool:
+    """Determine if a prompt requires actual implementation work.
+
+    This deterministic classifier distinguishes between:
+    - Analysis/documentation deliverables (memo, report, analysis, recommendation, checklist)
+      which do NOT require implementation
+    - Explicit implementation requests (implement, build, develop, ship, code, prototype,
+      construct, runnable, executable) which DO require implementation
+    - "Create" followed by concrete artifacts (dashboard, API, system, app, etc.) which
+      DO require implementation
+
+    Returns False for:
+    - Explicit analysis-only or no-implementation briefs
+    - Producing/writing memos, reports, analyses, recommendations, or checklists
+
+    Returns True for:
+    - Explicit implement/build/develop/ship/code/prototype/construct/runnable/executable
+    - "Create a dashboard" or similar concrete artifact creation
+    """
+    lowered = prompt.lower()
+
+    # Early exit: explicit no-implementation or analysis-only directives
+    no_impl_markers = (
+        "no implementation",
+        "analysis only",
+        "analyses only",
+        "do not implement",
+        "don't implement",
+        "no need to implement",
+        "not implement",
+    )
+    if any(marker in lowered for marker in no_impl_markers):
+        return False
+
+    # Explicit implementation language takes precedence over an accompanying
+    # documentation deliverable (for example, "build the API and write a report").
+    strong_impl_markers = (
+        "implement",
+        "build",
+        "develop",
+        "ship",
+        "code",
+        "prototype",
+        "construct",
+        "runnable",
+        "executable",
+    )
+    if any(marker in lowered for marker in strong_impl_markers):
+        return True
+
+    # Document deliverables that don't require implementation
+    doc_deliverables = (
+        "memo",
+        "report",
+        "analysis",
+        "recommendation",
+        "checklist",
+        "summary",
+        "overview",
+        "review",
+        "assessment",
+        "evaluation",
+    )
+
+    # Check if prompt is asking to produce/write/create a document
+    doc_verbs = ("produce", "write", "create", "draft", "prepare", "generate")
+    for verb in doc_verbs:
+        if verb in lowered:
+            # Check if it's followed by a document deliverable
+            for deliverable in doc_deliverables:
+                if deliverable in lowered:
+                    return False
+
+    # "Create" requires context - only counts if followed by concrete artifact
+    if "create" in lowered:
+        concrete_artifacts = (
+            "dashboard",
+            "api",
+            "system",
+            "app",
+            "application",
+            "service",
+            "tool",
+            "feature",
+            "component",
+            "module",
+            "interface",
+            "website",
+            "platform",
+            "solution",
+            "program",
+            "function",
+            "class",
+            "method",
+            "endpoint",
+            "integration",
+            "automation",
+            "pipeline",
+            "workflow",
+            "script",
+        )
+        if any(artifact in lowered for artifact in concrete_artifacts):
+            return True
+
+    return False
+
+
+def _prompt_requires_collaborative_notes_demo(prompt: str) -> bool:
+    """Return whether the request actually asks for the notes-demo benchmark.
+
+    ``execute_notes_demo`` creates a fixed ``server.py``/``client.html``
+    artifact pair. That evidence is only relevant to collaborative-notes
+    delivery and must not satisfy an unrelated code-execution request.
+    """
+
+    lowered = prompt.lower()
+    return "collaborative notes" in lowered or "collaborative-notes" in lowered
+
+
+def _prompt_requires_validation(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "validat",
+            "test",
+            "verify",
+            "check",
+            "acceptance",
+            "quality",
+            "review",
+            "audit",
+            "risk",
+            "safe",
+        )
+    )
+
+
+def _is_execution_output_blocker(reason: str) -> bool:
+    """Identify circular readiness objections that demand work-phase outputs.
+
+    .. deprecated::
+        Retained for backward compatibility only. The runtime decision-maker
+        is :func:`_is_structured_execution_blocker`, which uses typed blocker
+        categories rather than keyword heuristics.
+    """
+
+    lowered = reason.lower()
+    output_markers = (
+        "implementation", "artifact", "citation", "url", "evidence", "validation",
+        "test result", "builder", "critic", "researcher", "leader election",
+    )
+    absence_markers = ("missing", "not yet", "has not", "haven't", "incomplete", "without")
+    return any(marker in lowered for marker in output_markers) and any(
+        marker in lowered for marker in absence_markers
+    )
+
+
+def _is_structured_execution_blocker(ballot: ReadinessBallot) -> bool:
+    """Decide whether a readiness ballot blocks execution using typed categories.
+
+    Only ballots whose ``blocker_category`` is in ``BLOCKING_CATEGORIES``
+    (``missing_user_input``, ``missing_system_capability``, ``safety_or_policy``)
+    block execution. Ballots categorized as ``future_work`` or ``risk`` are
+    recorded but do not block.
+
+    Legacy critical ballots without a category block conservatively. Their
+    prose is never inspected to make the readiness decision.
+    """
+
+    if not ballot.critical_blocker:
+        return False
+    if ballot.blocker_category is not None:
+        return ballot.blocker_category in BLOCKING_CATEGORIES
+    return True
+
+
+def _json_only_retry_instruction(tool_name: str, schema_class: Type[BaseModel]) -> str:
+    """Ask providers without a tool envelope for one schema-bound JSON result."""
+
+    properties = ", ".join(schema_class.model_json_schema().get("properties", {}).keys())
+    return (
+        f"Your previous response did not call the required `{tool_name}` tool. "
+        f"Retry now: call `{tool_name}` exactly once. If this provider cannot emit a tool call, "
+        f"return ONLY one complete JSON object with these fields: {properties}. "
+        "Do not include markdown, commentary, or any surrounding prose."
+    )
+
+
+def _strict_json_only_instruction(tool_name: str, schema_class: Type[BaseModel]) -> str:
+    """Strict complete-JSON-only instruction with full schema for providers that cannot use output_schema."""
+
+    schema = schema_class.model_json_schema()
+    schema_json = json.dumps(schema, indent=2)
+    return (
+        f"Return ONLY a single complete JSON object matching this schema exactly. "
+        f"No markdown, no commentary, no prose, no code fences. "
+        f"The JSON object must validate against:\n{schema_json}\n"
+        f"Your entire response must be parseable by json.loads() as one object."
+    )
+
+
 def _extract_tool_result(
     response: Any,
     tool_name: str,
@@ -98,8 +389,10 @@ def _extract_tool_result(
 ) -> T:
     """Extract and validate a native tool result from an Agno response.
 
-    Governance in LLM-enabled mode is only valid when Agno exposes an explicit
-    tool result. A model response that merely contains JSON in prose is rejected.
+    Prefer Agno's explicit tool result. Some OpenAI-compatible Qwen responses
+    return the forced tool arguments as a standalone JSON response instead of
+    populating ``response.tools``; accept that exact, schema-validated object
+    too. Never mine a decision from surrounding prose.
     """
     raw_json: str | None = None
 
@@ -114,6 +407,17 @@ def _extract_tool_result(
                     break
 
     if raw_json is None:
+        content = getattr(response, "content", None)
+        if isinstance(content, BaseModel):
+            raw_json = content.model_dump_json()
+        elif isinstance(content, dict):
+            raw_json = json.dumps(content)
+        elif isinstance(content, str):
+            # ``_parse_json_response`` only accepts a complete JSON object;
+            # prose containing an embedded vote remains invalid.
+            raw_json = content
+
+    if raw_json is None:
         raise ValueError(f"No tool result found for '{tool_name}' in agent response")
 
     parsed = _parse_json_response(raw_json)
@@ -126,65 +430,6 @@ def _extract_tool_result(
         raise ValueError(f"Tool result validation failed for '{tool_name}': {exc}") from exc
 
 
-def _fallback_goal_discussion(task: TaskRun, actor: SocietyAgent, prompt: str, reason: str) -> GoalDiscussionStatement:
-    """Create a typed meeting contribution when a non-critical discussion tool call fails.
-
-    This keeps the visible run moving while preserving that the model/tool path
-    had a recoverable shape error. It is intentionally limited to the
-    pre-execution conversation because later governance decisions still require
-    explicit tool output.
-    """
-
-    return GoalDiscussionStatement(
-        round=1,
-        agent_id=actor.id,
-        stance="clarifies",
-        interpretation=task.prompt[:240],
-        unique_contribution=f"{actor.name} could not provide a structured tool response, so the society is carrying a cautious fallback note.",
-        success_criteria=[],
-        concerns=[f"Recovered from missing tool result: {reason[:160]}"],
-        suggested_scope="Continue with the mission brief and preserve the tool failure as a caveat.",
-        question_for_next=None,
-        spoken_turn=f"I hit a tool-format issue, so I am keeping my contribution conservative: continue from the brief and treat my missing structured output as a caveat.",
-    )
-
-
-def _fallback_readiness_ballot(actor: SocietyAgent, reason: str) -> ReadinessBallot:
-    """Return a cautious ready vote when the readiness tool transport fails."""
-
-    return ReadinessBallot(
-        attempt=1,
-        agent_id=actor.id,
-        ready=True,
-        critical_blocker=False,
-        reason=f"Recovered from readiness tool issue; no critical blocker was produced. {reason[:120]}",
-    )
-
-
-def _fallback_agent_position(actor: SocietyAgent, phase: str, reason: str) -> AgentPosition:
-    """Return a visible neutral/support stance for non-critical social tracing."""
-
-    return AgentPosition(
-        agent_id=actor.id,
-        phase=phase,
-        stance="support",
-        reason=f"Recovered from social tool issue; carrying the brief forward with caveat. {reason[:120]}",
-        confidence=0.5,
-        conditions=[],
-    )
-
-
-def _fallback_private_note(actor: SocietyAgent, phase: str, reason: str) -> PrivateNote:
-    """Return a private note that preserves a recoverable social-tool issue."""
-
-    return PrivateNote(
-        agent_id=actor.id,
-        phase=phase,
-        note=f"Recovered from private-note tool issue: {reason[:180]}",
-        may_publish=False,
-    )
-
-
 class GovernanceToolError(Exception):
     """Raised when a native governance tool call fails in LLM-enabled mode."""
 
@@ -194,7 +439,12 @@ class SocietyOrchestrator:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self.events = EventStore(Path(__file__).resolve().parent / "data" / "events.jsonl")
+        event_path = (
+            Path(self.settings.event_store_file).expanduser()
+            if self.settings.event_store_file
+            else Path(__file__).resolve().parent / "data" / "events.jsonl"
+        )
+        self.events = EventStore(event_path)
         self.tasks: dict[str, TaskRun] = {}
         self.teams: dict[str, Team] = {}
         self.session_states: dict[str, dict[str, Any]] = {}
@@ -204,7 +454,10 @@ class SocietyOrchestrator:
         self.reputation = ReputationStore()
         self.agno_db = get_agno_db(self.settings)
         self.agents: dict[str, SocietyAgent] = self._seed_agents()
+        self._composition_cancellation_events: dict[str, asyncio.Event] = {}
         self._load_reputation_from_events()
+        self._reconcile_stale_running_tasks()
+        self._restore_from_events()
 
     def _seed_agents(self) -> dict[str, SocietyAgent]:
         agents = [
@@ -278,6 +531,350 @@ class SocietyOrchestrator:
             if event.type == "reputation_updated" and isinstance(event.payload.get("reputations"), dict):
                 self.reputation.load_snapshot(event.payload["reputations"])
                 return
+
+    def _restore_from_events(self) -> None:
+        """Reconstruct in-memory task/team/session state from the event log.
+
+        The event log is the authoritative persistence store. On startup, this
+        method replays events to find tasks that were interrupted mid-run or
+        paused for user clarification and rebuilds the minimum in-memory state
+        needed to resume or report them truthfully.
+
+        Tasks paused for either readiness clarification or vote resolution are
+        reconstructed with enough team/session state to resume. Tasks that
+        were still ``running`` at shutdown remain interrupted summaries so
+        callers see the honest truth rather than fabricated completion.
+        """
+
+        for task_id in self.events.task_ids():
+            events = self.events.list(task_id)
+            if not events:
+                continue
+            last_status = self._derive_final_status(events)
+            if last_status != "waiting_for_user":
+                continue
+            pause_event = None
+            for event in reversed(events):
+                if event.type == "user_clarification_requested":
+                    pause_event = event
+                    break
+            if pause_event is None:
+                continue
+            resume_phase = pause_event.payload.get("resume_phase")
+            if task_id in self.tasks:
+                continue
+            if resume_phase == "vote_resolution":
+                self._reconstruct_vote_resolution_task(task_id, events, pause_event)
+            elif resume_phase == "team_composition":
+                self._reconstruct_team_composition_task(task_id, events, pause_event)
+            else:
+                self._reconstruct_readiness_task(task_id, events, pause_event)
+
+    def _reconcile_stale_running_tasks(self) -> None:
+        """Mark event-ledger runs orphaned by a process restart as interrupted."""
+
+        for task_id in self.events.task_ids():
+            events = self.events.list(task_id)
+            if not events or self._derive_final_status(events) != "running":
+                continue
+            self.events.append(
+                SocietyEvent(
+                    task_id=task_id,
+                    type="task_interrupted",
+                    message="Task was interrupted because the application process restarted.",
+                    payload={"phase": "unknown", "reason": "process_restart"},
+                )
+            )
+
+    @staticmethod
+    def _derive_final_status(events: list[SocietyEvent]) -> str:
+        """Walk events in order and return the last known task status."""
+
+        status = "running"
+        for event in events:
+            if event.type == "task_complete":
+                payload = event.payload if isinstance(event.payload, dict) else {}
+                acc = payload.get("acceptance_status")
+                if acc == "complete_with_warnings":
+                    status = "complete_with_warnings"
+                else:
+                    status = "complete"
+            elif event.type == "task_remediation" and status not in {"complete", "complete_with_warnings", "failed"}:
+                status = "remediation"
+            elif event.type == "task_interrupted" and status not in {"complete", "complete_with_warnings", "failed"}:
+                status = "interrupted"
+            elif event.type == "task_failed" and status not in {"complete", "complete_with_warnings", "interrupted"}:
+                status = "failed"
+            elif event.type == "user_clarification_requested" and status == "running":
+                status = "waiting_for_user"
+            elif event.type == "society_resumed" and status == "waiting_for_user":
+                status = "running"
+        return status
+
+    def _reconstruct_vote_resolution_task(
+        self,
+        task_id: str,
+        events: list[SocietyEvent],
+        pause_event: SocietyEvent,
+    ) -> None:
+        """Rebuild TaskRun, Team, and session state for a vote-resolution pause.
+
+        The event payload carries the full proposals, team roster, leader, and
+        tally so that ``apply_user_clarification`` and
+        ``continue_after_clarification`` can resume without rerunning pre-vote
+        phases.
+        """
+
+        prompt = None
+        for event in events:
+            if event.type == "task_received":
+                prompt = event.payload.get("prompt")
+                break
+        if prompt is None:
+            prompt = pause_event.payload.get("task_prompt")
+        if prompt is None:
+            return
+
+        task = TaskRun(prompt=prompt, status="waiting_for_user")
+        task.id = task_id
+        task.created_at = events[0].created_at
+        task.updated_at = events[-1].created_at
+        self.tasks[task_id] = task
+
+        team_member_ids = list(pause_event.payload.get("team_member_ids", []))
+        team_leader_id = pause_event.payload.get("team_leader_id")
+        if not team_member_ids:
+            return
+        voter_ids = list(pause_event.payload.get("voter_ids", [])) or list(team_member_ids[:4])
+        team = Team(task_id=task_id, member_ids=team_member_ids, voter_ids=voter_ids, leader_id=team_leader_id, status="active")
+        self.teams[team.id] = team
+        task.team_id = team.id
+
+        proposals_raw = pause_event.payload.get("proposals", {})
+        proposals: dict[str, str] = {}
+        for cid, entry in proposals_raw.items():
+            if isinstance(entry, dict):
+                proposals[cid] = str(entry.get("proposal", ""))
+            else:
+                proposals[cid] = str(entry)
+
+        state = initial_session_state(prompt, [])
+        state["task_id"] = task_id
+        state["phase"] = "voted"
+        state["resume_phase"] = "vote_resolution"
+        state["vote_resolution"] = {
+            "proposals": proposals,
+            "team_member_ids": team_member_ids,
+            "team_leader_id": team_leader_id,
+            "tally": dict(pause_event.payload.get("tally", {})),
+            "candidates": list(pause_event.payload.get("valid_candidate_ids", [])),
+        }
+        state["user_clarification"] = {
+            "status": "requested",
+            "question": pause_event.payload.get("question", ""),
+            "resume_phase": "vote_resolution",
+            "tally": pause_event.payload.get("tally", {}),
+            "valid_candidate_ids": list(pause_event.payload.get("valid_candidate_ids", [])),
+        }
+        state["proposals"] = {
+            cid: {"proposal": proposals.get(cid, ""), "proposal_id": f"prop-id-{cid}"}
+            for cid in proposals
+        }
+        self.session_states[task_id] = state
+
+    def _reconstruct_readiness_task(
+        self,
+        task_id: str,
+        events: list[SocietyEvent],
+        pause_event: SocietyEvent,
+    ) -> None:
+        """Rebuild a readiness-paused task so clarification survives restart."""
+
+        received = next((event for event in events if event.type == "task_received"), None)
+        prompt = received.payload.get("prompt") if received is not None else None
+        if not isinstance(prompt, str) or not prompt.strip():
+            return
+
+        team_data: dict[str, Any] = {}
+        for event in events:
+            if event.type == "team_formed" and isinstance(event.payload.get("team"), dict):
+                team_data = event.payload["team"]
+                break
+        raw_members = team_data.get("member_ids") or list(self.agents.keys())[:4]
+        member_ids = raw_members.split() if isinstance(raw_members, str) else list(raw_members)
+        member_ids = [agent_id for agent_id in member_ids if agent_id in self.agents]
+        if not member_ids:
+            return
+        raw_voters = team_data.get("voter_ids") or member_ids[:4]
+        voter_ids = raw_voters.split() if isinstance(raw_voters, str) else list(raw_voters)
+        voter_ids = [agent_id for agent_id in voter_ids if agent_id in member_ids]
+
+        task = TaskRun(prompt=prompt, status="waiting_for_user")
+        task.id = task_id
+        task.created_at = events[0].created_at
+        task.updated_at = events[-1].created_at
+        team = Team(
+            task_id=task_id,
+            member_ids=member_ids,
+            voter_ids=voter_ids,
+            leader_id=team_data.get("leader_id"),
+            status="active",
+        )
+        if isinstance(team_data.get("id"), str):
+            team.id = team_data["id"]
+        task.team_id = team.id
+
+        roster = [self.agents[agent_id].model_dump() for agent_id in member_ids]
+        state = initial_session_state(prompt, roster)
+        state.update({
+            "task_id": task_id,
+            "phase": "waiting_for_user",
+            "resume_phase": pause_event.payload.get("resume_phase") or "post_readiness",
+            "readiness_tally": {
+                "blockers": list(pause_event.payload.get("blockers", [])),
+                "open_questions": list(pause_event.payload.get("open_questions", [])),
+            },
+            "user_clarification": {"status": "requested", **pause_event.payload},
+            "reputations": self._reputation_snapshot(member_ids),
+        })
+
+        self.tasks[task_id] = task
+        self.teams[team.id] = team
+        self.session_states[task_id] = state
+        self.workflows[task_id] = build_governance_workflow(
+            state,
+            db=self.agno_db,
+            routing_enabled=self.settings.workflow_routing_enabled,
+        )
+        if self.settings.llm_enabled:
+            self.agno_teams[team.id] = build_society_team(
+                [self.agents[agent_id] for agent_id in member_ids],
+                self.settings,
+                session_state=state,
+                session_id=task_id,
+            )
+
+    def _reconstruct_team_composition_task(
+        self,
+        task_id: str,
+        events: list[SocietyEvent],
+        pause_event: SocietyEvent,
+    ) -> None:
+        """Rebuild a task paused during team composition so restart can resume once."""
+
+        received = next((event for event in events if event.type == "task_received"), None)
+        prompt = received.payload.get("prompt") if received is not None else pause_event.payload.get("task_prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return
+
+        team_payload = None
+        for event in events:
+            if event.type == "team_formed" and isinstance(event.payload.get("team"), dict):
+                team_payload = event.payload["team"]
+                break
+        member_ids = [str(agent_id) for agent_id in pause_event.payload.get("team_member_ids", []) if str(agent_id)]
+        voter_ids = [str(agent_id) for agent_id in pause_event.payload.get("voter_ids", []) if str(agent_id)]
+        leader_id = pause_event.payload.get("team_leader_id")
+        team_id = pause_event.payload.get("team_id")
+        if not member_ids and isinstance(team_payload, dict):
+            member_ids = [str(agent_id) for agent_id in team_payload.get("member_ids", []) if str(agent_id)]
+        if not voter_ids and isinstance(team_payload, dict):
+            voter_ids = [str(agent_id) for agent_id in team_payload.get("voter_ids", []) if str(agent_id)]
+        if leader_id is None and isinstance(team_payload, dict):
+            leader_id = team_payload.get("leader_id")
+        if not isinstance(team_id, str) and isinstance(team_payload, dict) and isinstance(team_payload.get("id"), str):
+            team_id = team_payload["id"]
+        if not member_ids:
+            return
+
+        task = TaskRun(prompt=prompt, status="waiting_for_user")
+        task.id = task_id
+        task.created_at = events[0].created_at
+        task.updated_at = events[-1].created_at
+
+        team = Team(
+            task_id=task_id,
+            member_ids=member_ids,
+            voter_ids=voter_ids,
+            leader_id=leader_id,
+            status="active",
+        )
+        if isinstance(team_id, str):
+            team.id = team_id
+        task.team_id = team.id
+
+        roster = [self.agents[agent_id].model_dump() for agent_id in member_ids if agent_id in self.agents]
+        state = initial_session_state(prompt, roster)
+        state.update({
+            "task_id": task_id,
+            "phase": "waiting_for_user",
+            "resume_phase": "team_composition",
+            "working_brief": pause_event.payload.get("working_brief"),
+            "team_coordination_brief": pause_event.payload.get("team_coordination_brief"),
+            "readiness_tally": copy.deepcopy(pause_event.payload.get("readiness_tally", {})),
+            "user_clarification": {"status": "requested", **pause_event.payload},
+            "reputations": self._reputation_snapshot(member_ids),
+        })
+        composition_state = pause_event.payload.get("composition_state")
+        if isinstance(composition_state, dict):
+            state["team_composition"] = copy.deepcopy(composition_state)
+        state["composition_execution_roster"] = copy.deepcopy(
+            state.get("team_composition", {}).get("materialized_agents", [])
+        )
+
+        self.tasks[task_id] = task
+        self.teams[team.id] = team
+        self.session_states[task_id] = state
+        self.workflows[task_id] = build_governance_workflow(
+            state,
+            db=self.agno_db,
+            routing_enabled=self.settings.workflow_routing_enabled,
+        )
+        if self.settings.llm_enabled:
+            self.agno_teams[team.id] = build_society_team(
+                [self.agents[agent_id] for agent_id in member_ids if agent_id in self.agents],
+                self.settings,
+                session_state=state,
+                session_id=task_id,
+            )
+
+    def shutdown(self) -> None:
+        """Mark every in-process running task as interrupted in the event log.
+
+        Graceful shutdown must not leave running tasks persisted with no worker.
+        This method emits truthful ``task_interrupted`` and ``task_failed``
+        events for any task still marked ``running`` in memory, then updates
+        their status so summaries report the interruption rather than a
+        fabricated completion.
+        """
+
+        for task_id, task in list(self.tasks.items()):
+            cancellation_event = self._composition_cancellation_events.get(task_id)
+            if cancellation_event is not None:
+                cancellation_event.set()
+            if task.status != "running":
+                continue
+            state = self._state(task_id)
+            phase = state.get("phase", "unknown")
+            state["interruption"] = {
+                "reason": "graceful_shutdown",
+                "phase": phase,
+                "requested_at": now_iso(),
+            }
+            task.status = "interrupted"
+            task.updated_at = now_iso()
+            self._emit(
+                task_id,
+                "task_interrupted",
+                f"Task was interrupted during {phase} by graceful shutdown.",
+                payload={"phase": phase, "reason": "graceful_shutdown"},
+            )
+            self._emit(
+                task_id,
+                "task_failed",
+                f"Task interrupted by graceful shutdown during {phase}.",
+                payload={"phase": phase, "error": "graceful_shutdown", "interrupted": True},
+            )
 
     def list_events(self, task_id: str | None = None) -> list[SocietyEvent]:
         return self.events.list(task_id)
@@ -426,22 +1023,27 @@ class SocietyOrchestrator:
             task.updated_at = now_iso()
             await self._run_agno_team(task, team)
             await self._elect_leader(task, team)
-            await self._spawn_child_agent(task, team)
-            proposals = await self._negotiate(task, team)
-            await self._delegate_subtasks(task, team)
-            await self._collect_proposal_opinions(task, team, proposals)
-            winner = await self._vote(task, team, proposals)
-            await self._monitor(task, team, winner, proposals)
-            task.final_answer = self._compose_answer(task, team, winner, proposals)
-            self._populate_acceptance_checks(task.id, team)
-            task.final_answer = self._apply_validation_gate(task, team)
-            await self._record_evaluation_metrics(task, team, winner)
-            await self._learn(task, team, winner)
-            self._dissolve(task, team)
-            task.status = "complete"
-            task.updated_at = now_iso()
-            self._record_task_metrics(task, start_time)
-            self._emit(task.id, "task_complete", "The society produced a final answer.", payload={"answer": task.final_answer})
+            if not self.settings.efficient_society_enabled:
+                await self._spawn_child_agent(task, team)
+            else:
+                self._state(task.id)["spawn_decision"] = {
+                    "spawn": False,
+                    "reason": "Defer spawning until a typed capability gap or validation gate exists.",
+                }
+                self._emit(
+                    task.id,
+                    "efficient_phase_skipped",
+                    "A speculative specialist-spawn call was skipped.",
+                    payload={"phase": "spawn_decision", "reason": "defer_until_typed_capability_gap"},
+                )
+            composition_status = await self._run_team_composition_phase(task, team)
+            if composition_status == "paused":
+                return
+            if composition_status == "failed":
+                return
+            if composition_status != "completed":
+                await self._delegate_subtasks(task, team)
+            await self._continue_after_execution(task, team, start_time)
         except GovernanceToolError as exc:
             task.status = "failed"
             task.updated_at = now_iso()
@@ -469,6 +1071,149 @@ class SocietyOrchestrator:
                 payload={
                     "phase": state.get("phase", "unknown"),
                     "error": str(exc),
+                    "current_actor": state.get("current_actor"),
+                },
+            )
+        except Exception as exc:
+            task.status = "failed"
+            task.updated_at = now_iso()
+            state = self._state(task.id)
+            self._record_failure_recovery(task.id, str(exc), state)
+            diagnosis = self._diagnose_failure(task.id)
+            failure_payload = {
+                "phase": state.get("phase", "unknown"),
+                "blocking_reason": str(exc),
+                "missing_inputs": diagnosis["missing_inputs"],
+                "missing_evidence": diagnosis["missing_evidence"],
+                "system_error": str(exc),
+                "recoverable": False,
+            }
+            self._emit(
+                task.id,
+                "run_failed",
+                f"Run failed with system error: {exc}",
+                payload=failure_payload,
+            )
+            self._emit(
+                task.id,
+                "task_failed",
+                str(exc),
+                payload={
+                    "phase": state.get("phase", "unknown"),
+                    "error": str(exc),
+                    "current_actor": state.get("current_actor"),
+                },
+            )
+
+    async def _complete_after_vote(
+        self,
+        task: TaskRun,
+        team: Team,
+        winner: str,
+        proposals: dict[str, str],
+        start_time: float,
+    ) -> None:
+        """Run the post-vote completion path: monitor, answer, metrics, learning, dissolve."""
+
+        efficient_mode = bool(getattr(getattr(self, "settings", None), "efficient_society_enabled", False))
+        if not (
+            efficient_mode and self._state(task.id).get("critique_source") == "lean_counterproposal"
+        ):
+            await self._monitor(task, team, winner, proposals)
+        else:
+            self._emit(
+                task.id,
+                "efficient_phase_skipped",
+                "The recorded critic counterproposal already supplied peer review.",
+                payload={"phase": "monitor", "reason": "lean_counterproposal_review"},
+            )
+        task.final_answer = self._compose_answer(task, team, winner, proposals)
+        self._record_demo_proof(task, team)
+        self._state(task.id)["prompt"] = task.prompt
+        self._populate_acceptance_checks(task.id, team)
+        await self._run_independent_validator(task, team)
+        task.final_answer = self._apply_validation_gate(task, team)
+        await self._record_evaluation_metrics(task, team, winner)
+        await self._learn(task, team, winner)
+        self._dissolve(task, team)
+
+        state = self._state(task.id)
+        proof = state.get("demo_proof") or {}
+        proof_verified = bool(proof.get("verified"))
+        missing_markers = list(proof.get("missing_markers", []))
+        evidence = state.get("acceptance_evidence") or {}
+        terminal = evidence.get("terminal_status", "complete")
+        required_failures = list(evidence.get("required_failures", []))
+        optional_failures = list(evidence.get("optional_failures", []))
+
+        task.updated_at = now_iso()
+        self._record_task_metrics(task, start_time)
+
+        if terminal == "complete":
+            task.status = "complete"
+            self._emit(
+                task.id,
+                "task_complete",
+                "The society produced a final answer.",
+                payload={
+                    "answer": task.final_answer,
+                    "demo_proof_verified": proof_verified,
+                    "missing_markers": missing_markers,
+                    "acceptance_status": "complete",
+                },
+            )
+        elif terminal == "complete_with_warnings":
+            task.status = "complete_with_warnings"
+            self._emit(
+                task.id,
+                "task_complete",
+                "The society produced a final answer with warnings.",
+                payload={
+                    "answer": task.final_answer,
+                    "demo_proof_verified": proof_verified,
+                    "missing_markers": missing_markers,
+                    "acceptance_status": "complete_with_warnings",
+                    "optional_failures": optional_failures,
+                },
+            )
+        elif terminal == "remediation":
+            task.status = "remediation"
+            self._emit(
+                task.id,
+                "task_remediation",
+                "Required acceptance checks failed; remediation is possible.",
+                payload={
+                    "answer": task.final_answer,
+                    "required_failures": required_failures,
+                    "recoverable": True,
+                    "acceptance_status": "remediation",
+                },
+            )
+        else:
+            task.status = "failed"
+            diagnosis = self._diagnose_failure(task.id)
+            self._emit(
+                task.id,
+                "run_failed",
+                "Required acceptance checks failed with no recovery path.",
+                payload={
+                    "phase": state.get("phase", "validation"),
+                    "blocking_reason": f"Required acceptance checks failed: {', '.join(required_failures)}",
+                    "missing_inputs": diagnosis["missing_inputs"],
+                    "missing_evidence": required_failures,
+                    "system_error": None,
+                    "recoverable": False,
+                },
+            )
+            self._emit(
+                task.id,
+                "task_failed",
+                f"Acceptance evidence exhausted: {', '.join(required_failures)}",
+                payload={
+                    "phase": state.get("phase", "validation"),
+                    "error": f"Required acceptance checks failed: {', '.join(required_failures)}",
+                    "required_failures": required_failures,
+                    "acceptance_status": "failed",
                     "current_actor": state.get("current_actor"),
                 },
             )
@@ -506,6 +1251,80 @@ class SocietyOrchestrator:
             payload=payload,
         )
 
+    def _pause_for_vote_resolution(
+        self,
+        task: TaskRun,
+        team: Team,
+        proposals: dict[str, str],
+        tally: dict[str, int],
+        candidates: list[str],
+        reason: str = "no_valid_winner",
+        tied_candidates: list[str] | None = None,
+    ) -> None:
+        """Pause after a vote with no clear winner; the elected leader asks the user to choose."""
+
+        state = self._state(task.id)
+        leader_id = team.leader_id or team.member_ids[0]
+        leader = self.agents[leader_id]
+        proposal_summaries = []
+        for cid in candidates:
+            entry = proposals.get(cid, "")
+            if isinstance(entry, dict):
+                text = str(entry.get("proposal", ""))
+            else:
+                text = str(entry)
+            proposal_summaries.append({"candidate_id": cid, "proposal_summary": text[:200]})
+        if reason == "tie" and tied_candidates:
+            question = (
+                f"{leader.name} reports: the vote ended in a tie among "
+                f"{', '.join(tied_candidates)}. "
+                f"Please select one candidate agent id to proceed."
+            )
+        elif reason == "empty_tally":
+            question = (
+                f"{leader.name} reports: no ballots were recorded, so there is no winner. "
+                f"Please select one candidate agent id from {', '.join(candidates)} to proceed."
+            )
+        else:
+            question = (
+                f"{leader.name} reports: the tally did not produce a valid winner. "
+                f"Tally: {tally}. "
+                f"Please select one candidate agent id from {', '.join(candidates)} to proceed."
+            )
+        payload = {
+            "question": question,
+            "tally": tally,
+            "valid_candidate_ids": list(candidates),
+            "proposal_summaries": proposal_summaries,
+            "reason": reason,
+            "tied_candidates": list(tied_candidates) if tied_candidates else [],
+            "leader_id": leader_id,
+            "resume_phase": "vote_resolution",
+            "proposals": {cid: proposals[cid] for cid in candidates},
+            "team_member_ids": list(team.member_ids),
+            "voter_ids": self._voter_ids(team),
+            "team_leader_id": team.leader_id,
+            "task_prompt": task.prompt,
+        }
+        state["resume_phase"] = "vote_resolution"
+        state["vote_resolution"] = {
+            "proposals": {cid: proposals[cid] for cid in candidates},
+            "team_member_ids": list(team.member_ids),
+            "voter_ids": self._voter_ids(team),
+            "team_leader_id": team.leader_id,
+            "tally": tally,
+            "candidates": list(candidates),
+        }
+        state["user_clarification"] = {"status": "requested", **payload}
+        task.status = "waiting_for_user"
+        task.updated_at = now_iso()
+        self._emit(
+            task.id,
+            "user_clarification_requested",
+            "The elected leader needs the user to break a vote deadlock.",
+            payload=payload,
+        )
+
     def apply_user_clarification(self, task_id: str, answer: str) -> TaskRun:
         """Inject a user clarification into a paused task."""
 
@@ -519,11 +1338,52 @@ class SocietyOrchestrator:
         if team is None:
             raise ValueError("Task has no active team to resume")
 
+        resume_phase = state.get("resume_phase") or "post_readiness"
+
+        if resume_phase == "vote_resolution":
+            vote_resolution = state.get("vote_resolution") or {}
+            valid_candidates = list(vote_resolution.get("candidates", []))
+            chosen = answer.strip()
+            if chosen not in valid_candidates:
+                raise ValueError(
+                    f"Answer '{answer}' is not a valid candidate agent id. "
+                    f"Valid candidates: {valid_candidates}"
+                )
+            state["winner_id"] = chosen
+            state["phase"] = "voted"
+            clarification = {
+                "status": "answered",
+                "answer": chosen,
+                "answered_at": now_iso(),
+                "resume_phase": "vote_resolution",
+            }
+            state["user_clarification"] = clarification
+            self._emit(
+                task.id,
+                "user_decision_resolved",
+                f"User selected {self.agents[chosen].name} to break the vote deadlock.",
+                actor=chosen,
+                payload={
+                    "selected_winner": chosen,
+                    "valid_candidate_ids": valid_candidates,
+                    "tally": vote_resolution.get("tally", {}),
+                },
+            )
+            self._emit(
+                task.id,
+                "society_resumed",
+                "The society resumed from vote resolution.",
+                payload={"resume_phase": "vote_resolution"},
+            )
+            task.status = "running"
+            task.updated_at = now_iso()
+            return task
+
         clarification = {
             "status": "answered",
             "answer": answer,
             "answered_at": now_iso(),
-            "resume_phase": state.get("resume_phase") or "post_readiness",
+            "resume_phase": resume_phase,
         }
         state["user_clarification"] = clarification
         state["ready_to_proceed"] = True
@@ -569,6 +1429,32 @@ class SocietyOrchestrator:
         team = self.teams.get(task.team_id or "")
         if team is None:
             raise ValueError("Task has no active team to resume")
+        state = self._state(task_id)
+        resume_phase = state.get("resume_phase")
+        if resume_phase == "vote_resolution":
+            vote_resolution = state.get("vote_resolution") or {}
+            raw_proposals = vote_resolution.get("proposals", {})
+            proposals: dict[str, str] = {}
+            for cid, entry in raw_proposals.items():
+                if isinstance(entry, dict):
+                    proposals[cid] = str(entry.get("proposal", ""))
+                else:
+                    proposals[cid] = str(entry)
+            winner = state.get("winner_id")
+            if winner is None:
+                raise ValueError("No winner set after vote resolution")
+            await self._complete_after_vote(task, team, winner, proposals, time.time())
+            return task
+        if resume_phase == "team_composition":
+            composition = self._team_composition_state(task_id)
+            if composition.get("resume_used"):
+                raise ValueError("Team composition clarification has already been resumed once")
+            composition["resume_used"] = True
+            composition["status"] = "resuming"
+            outcome = await self._run_team_composition_phase(task, team, allow_started_resume=True)
+            if outcome == "completed":
+                await self._continue_after_execution(task, team, time.time())
+            return task
         await self._execute_after_readiness(task, team, time.time())
         return task
 
@@ -581,7 +1467,12 @@ class SocietyOrchestrator:
 
     def _form_team(self, task: TaskRun) -> Team:
         member_ids = list(self.agents.keys())[:4]
-        team = Team(task_id=task.id, member_ids=member_ids, status="active")
+        voter_ids: list[str] = []
+        for agent_id in member_ids:
+            registration = get_role_capabilities(resolve_role_key(self.agents[agent_id]))
+            if registration is not None and registration.can_vote:
+                voter_ids.append(agent_id)
+        team = Team(task_id=task.id, member_ids=member_ids, voter_ids=voter_ids, status="active")
         self.teams[team.id] = team
         task.team_id = team.id
         roster = [self.agents[agent_id].model_dump() for agent_id in member_ids]
@@ -603,7 +1494,57 @@ class SocietyOrchestrator:
                 session_id=task.id,
             )
         self._emit(task.id, "team_formed", "A temporary team formed for this problem.", payload={"team": team.model_dump()})
+        for agent_id in member_ids:
+            registration = get_role_capabilities(resolve_role_key(self.agents[agent_id]))
+            self._emit(
+                task.id,
+                "role_selected",
+                f"{self.agents[agent_id].name} joined for registered capabilities.",
+                actor=agent_id,
+                payload={
+                    "agent_id": agent_id,
+                    "role_key": registration.role if registration else resolve_role_key(self.agents[agent_id]),
+                    "capabilities": registration.capabilities if registration else [],
+                    "can_vote": agent_id in voter_ids,
+                    "selection_reason": registration.description if registration else "existing team identity",
+                },
+            )
         return team
+
+    @staticmethod
+    def _voter_ids(team: Team) -> list[str]:
+        """Return explicit voters, falling back for legacy persisted teams."""
+
+        return list(team.voter_ids or team.member_ids)
+
+    def _benchmark_equivalent_tie_winner(
+        self,
+        team: Team,
+        proposals: dict[str, str],
+        tied_candidates: list[str],
+    ) -> str | None:
+        """Resolve only exact-content ties when a benchmark cannot ask a user."""
+
+        if not self.settings.benchmark_suite_tools_enabled or len(tied_candidates) < 2:
+            return None
+        canonical: list[str] = []
+        for candidate_id in tied_candidates:
+            proposal = proposals.get(candidate_id)
+            if proposal is None:
+                return None
+            try:
+                parsed = json.loads(proposal)
+                canonical.append(json.dumps(parsed, sort_keys=True, separators=(",", ":")))
+            except (json.JSONDecodeError, TypeError):
+                canonical.append(str(proposal).strip())
+        if len(set(canonical)) != 1:
+            return None
+        if team.leader_id in tied_candidates:
+            return team.leader_id
+        return next(
+            (candidate_id for candidate_id in team.member_ids if candidate_id in tied_candidates),
+            tied_candidates[0],
+        )
 
     async def _run_governance_workflow(self, task: TaskRun) -> None:
         """Run the six-step Agno Workflow lifecycle spine for a task."""
@@ -710,14 +1651,17 @@ class SocietyOrchestrator:
             "assumptions, and delegation_hints."
         )
         try:
-            response = await asyncio.wait_for(
-                agno_team.arun(
+            response = await self._call_provider(
+                lambda: agno_team.arun(
                     prompt,
                     session_id=task.id,
                     session_state=self._state(task.id),
                     add_session_state_to_context=True,
                 ),
-                timeout=max(self.settings.llm_timeout_seconds, 120),
+                task_id=task.id,
+                actor="team",
+                operation="team_coordination",
+                timeout_seconds=max(self.settings.llm_timeout_seconds, 120),
             )
         except Exception as exc:
             brief = TeamCoordinationBrief(
@@ -739,6 +1683,7 @@ class SocietyOrchestrator:
                 "recovered": True,
             })
             return
+        self._capture_model_usage(task.id, response, "agno_team", team.leader_id or "team")
         raw_content = str(getattr(response, "content", response))[:1200]
         try:
             brief = self._build_coordination_brief_from_response(response, raw_content)
@@ -756,6 +1701,711 @@ class SocietyOrchestrator:
 
         return self.session_states.setdefault(task_id, initial_session_state("", []))
 
+    def _safe_list_events(self, task_id: str) -> list[SocietyEvent]:
+        """List events for a task, returning [] if the store is unavailable.
+
+        Unit tests may construct the orchestrator without a real EventStore.
+        This helper keeps production behavior intact while preventing
+        AttributeError in test contexts.
+        """
+
+        try:
+            return self.events.list(task_id)
+        except Exception:
+            return []
+
+    def _team_composition_state(self, task_id: str) -> dict[str, Any]:
+        """Return additive durable state for the typed composition executor."""
+
+        state = self._state(task_id)
+        current = state.get("team_composition")
+        if not isinstance(current, dict):
+            current = {}
+        defaults = {
+            "enabled": self._should_run_team_composition(task_id),
+            "status": "not_started",
+            "attempt_count": 0,
+            "recomposed": False,
+            "validation_issue_history": [],
+            "selected_plan": None,
+            "context_snapshot": None,
+            "execution_result": None,
+            "materialized_agents": [],
+            "availability_blockers": [],
+            "blocked": None,
+            "resume_used": False,
+        }
+        for key, value in defaults.items():
+            current.setdefault(key, copy.deepcopy(value))
+        current["enabled"] = self._should_run_team_composition(task_id)
+        state["team_composition"] = current
+        state.setdefault("composition_execution_roster", [])
+        return current
+
+    def _should_run_team_composition(self, task_id: str | None = None, *, allow_started_resume: bool = False) -> bool:
+        """Route new product missions to fixed specialists and preserve legacy replay.
+
+        Fixed-specialist composition is the only production path for supported
+        deliverables.  It intentionally remains selected when a provider or
+        runtime prerequisite is unavailable so the composition phase can emit
+        its typed terminal failure instead of falling through to the legacy
+        demo delegation seam.  Explicit legacy-composer plans retain their
+        existing flag-controlled behavior for historical replay and tests.
+        """
+
+        if allow_started_resume and task_id and self._is_legacy_composition_resume(task_id):
+            return bool(self.settings.llm_enabled)
+        return True
+
+    def _is_legacy_composition_resume(self, task_id: str) -> bool:
+        """Return whether durable replay state proves an old composer may resume."""
+
+        state = self.session_states.get(task_id, {})
+        composition = state.get("team_composition") if isinstance(state, dict) else None
+        return bool(
+            isinstance(state, dict)
+            and state.get("resume_phase") == "team_composition"
+            and isinstance(composition, dict)
+            and composition.get("selection_strategy") == "legacy_composer"
+        )
+
+    def _composition_artifact_root(self, task_id: str) -> Path:
+        """Return the per-task artifact directory for composition execution."""
+
+        return Path(__file__).resolve().parent / "data" / "composition" / task_id
+
+    def _team_composition_message(self, event_type: str, payload: dict[str, Any]) -> str:
+        """Render concise human-readable event messages for composition events."""
+
+        messages = {
+            "team_composition_proposed": "Typed team composition proposed a candidate plan.",
+            "team_composition_validated": "Typed team composition validated the execution plan.",
+            "team_recomposition_requested": "Typed team composition requested one bounded recomposition.",
+            "team_composition_blocked": "Typed team composition could not proceed safely.",
+            "composition_assignment_materialized": "A bounded composition specialist identity was materialized.",
+            "specialist_selection_proposed": "The elected leader proposed a fixed specialist team.",
+            "specialist_selection_rejected": "The fixed specialist selection was rejected with typed blockers.",
+            "specialist_selection_accepted": "The elected leader selected a verified fixed specialist team.",
+            "specialist_invocation_approved": "The elected leader approved a selected specialist assignment.",
+            "specialist_invocation_started": "An approved specialist assignment started after its dependencies cleared.",
+            "work_node_started": f"Work node {payload.get('node_id', '?')} started.",
+            "work_node_blocked": f"Work node {payload.get('node_id', '?')} is blocked.",
+            "work_node_failed": f"Work node {payload.get('node_id', '?')} failed.",
+            "work_node_retry_scheduled": f"Work node {payload.get('node_id', '?')} scheduled a retry.",
+            "work_node_canceled": f"Work node {payload.get('node_id', '?')} was canceled.",
+            "work_node_completed": f"Work node {payload.get('node_id', '?')} completed.",
+            "artifact_validated": "A composed artifact passed independent validation.",
+            "composition_assignment_cleanup_warning": "Composition runtime reported a cleanup warning.",
+            "composition_assignment_cleanup_completed": "Composition runtime closed the assignment sandbox.",
+        }
+        return messages.get(event_type, event_type.replace("_", " "))
+
+    def _emit_team_composition_event(self, task_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        """Persist a composition/runtime event into the existing SocietyEvent log."""
+
+        event_payload = copy.deepcopy(payload)
+        if event_type == "agentbay_artifact_exported":
+            artifact_ref = event_payload.get("artifact_ref")
+            if isinstance(artifact_ref, dict):
+                local_path = artifact_ref.pop("path", None)
+                if isinstance(local_path, str) and local_path:
+                    artifact_root = self._composition_artifact_root(task_id).resolve()
+                    candidate = Path(local_path).resolve()
+                    if candidate != artifact_root and artifact_root in candidate.parents:
+                        artifact_ref["storage_path"] = candidate.relative_to(artifact_root).as_posix()
+        actor = event_payload.get("agent_id")
+        actor_id = actor if isinstance(actor, str) and actor else None
+        self._emit(
+            task_id,
+            event_type,
+            self._team_composition_message(event_type, event_payload),
+            actor=actor_id,
+            payload=event_payload,
+        )
+
+    def _create_composition_runtime(self, task_id: str) -> CompositionRuntime:
+        """Create the production composition runtime with the orchestrator event sink."""
+
+        return CompositionRuntime(
+            self.settings,
+            self._composition_artifact_root(task_id),
+            event_sink=lambda event_type, payload: self._emit_team_composition_event(task_id, event_type, dict(payload)),
+        )
+
+    def _create_team_composer(self, task_id: str) -> TeamComposer:
+        """Create the production typed team composer for one task."""
+
+        provider = AgnoTeamPlanProvider(model=build_model(self.settings))
+        return TeamComposer(
+            provider,
+            lambda event_type, payload: self._emit_team_composition_event(task_id, event_type, dict(payload)),
+        )
+
+    async def _select_fixed_specialist_plan(
+        self,
+        task: TaskRun,
+        team: Team,
+        context: CompositionContext,
+        runtime: CompositionRuntime,
+    ) -> TeamCompositionResult:
+        """Have the elected leader select immutable specialists without a composer.
+
+        The first call lists the runtime-available repository catalog. The
+        second call accepts only assignment fields controlled by the leader.
+        Resolution attaches tools, skills, resource policy, and replay hashes
+        after schema validation. One bounded correction is allowed.
+        """
+
+        leader = self.agents.get(team.leader_id or "")
+        if leader is None:
+            raise GovernanceToolError("Fixed specialist selection requires an elected leader.")
+        coordinator = FixedSpecialistCoordinator(
+            runtime.available_tool_ids().tool_ids,
+            lambda event_type, payload: self._emit_team_composition_event(task.id, event_type, dict(payload)),
+        )
+        catalog = coordinator.list_specialists(ListSpecialistsCall())
+        state = self._state(task.id)
+        state["fixed_specialist_catalog"] = [entry.model_dump(mode="json") for entry in catalog]
+        # Keep the leader's catalog-tool invocation as governance evidence, but
+        # never use model-returned catalog content as routing authority. The
+        # repository-resolved catalog above is the complete selectable set.
+        await self._run_governance_tool(
+            task,
+            leader,
+            list_specialists_tool,
+            "list_specialists",
+            ListSpecialistsResult,
+            "List the fixed specialist templates available for this task before selecting a team.",
+            ["Do not invent or modify catalog entries."],
+        )
+
+        authoritative_catalog = {"specialists": state["fixed_specialist_catalog"]}
+        valid_template_ids = sorted(entry.template_id for entry in catalog)
+        blockers: list[dict[str, Any]] = []
+        resolved = None
+        for attempt in (1, 2):
+            correction = (
+                "\nThe previous selection was rejected. Correct only these blockers: "
+                + json.dumps(blockers, sort_keys=True)
+                + f". Valid template IDs are exactly: {json.dumps(valid_template_ids)}."
+                if blockers else ""
+            )
+            prompt = (
+                "Select the smallest capable fixed-specialist team for the task. "
+                "You may provide only template_id, assignment_id, objective, depends_on, "
+                "owned_artifacts, and acceptance_requirements. Never provide tools, skills, "
+                "credentials, locks, providers, or sandbox policy.\n"
+                f"Task: {task.prompt}\n"
+                f"Acceptance requirements: {json.dumps(context.acceptance_requirements)}\n"
+                f"Authoritative repository catalog: {json.dumps(authoritative_catalog, sort_keys=True)}"
+                f"{correction}"
+            )
+            selection_call = await self._run_governance_tool(
+                task,
+                leader,
+                select_specialists_tool,
+                "select_specialists",
+                SelectSpecialistsCall,
+                prompt,
+                ["Builder artifacts requiring acceptance must have a dependent Test Engineer assignment."],
+            )
+            try:
+                resolved = await coordinator.select_specialists(
+                    selection_call,
+                    task_summary=context.task_summary,
+                    required_capabilities=context.required_capabilities,
+                    required_acceptance_requirements=context.acceptance_requirements,
+                )
+                break
+            except SpecialistSelectionError as exc:
+                blockers = [blocker.model_dump(mode="json") for blocker in exc.blockers]
+                if attempt == 2:
+                    raise
+
+        if resolved is None:  # pragma: no cover - defensive; loop either resolves or raises.
+            raise GovernanceToolError("Fixed specialist selection produced no resolved plan.")
+        if hasattr(runtime, "set_invocation_hook"):
+            async def invoke_when_ready(node: Any, assignment: Any) -> None:
+                await coordinator.invoke_specialist(
+                    InvokeSpecialistCall(assignment_id=assignment.id),
+                    satisfied_dependency_ids=node.depends_on,
+                )
+
+            runtime.set_invocation_hook(invoke_when_ready)
+        state["fixed_specialist_selection"] = {
+            "assignments": [item.model_dump(mode="json") for item in resolved.assignments],
+            "strategy": "fixed_specialists",
+        }
+        return TeamCompositionResult(
+            plan=resolved.plan,
+            attempt_count=2 if blockers else 1,
+            recomposed=bool(blockers),
+            validation_issue_history=[],
+        )
+
+    @staticmethod
+    def _serialize_composition_context(context: Any) -> dict[str, Any] | None:
+        """Return a JSON-safe context snapshot for durable pause/resume state."""
+
+        try:
+            if isinstance(context, BaseModel):
+                return context.model_dump(mode="json")
+            if isinstance(context, dict):
+                return json.loads(json.dumps(context))
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    def _restore_composition_context_snapshot(self, task_id: str) -> CompositionContext | None:
+        """Restore a persisted composition context snapshot when it validates."""
+
+        composition = self._team_composition_state(task_id)
+        snapshot = composition.get("context_snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        try:
+            return CompositionContext.model_validate(copy.deepcopy(snapshot))
+        except ValidationError:
+            return None
+
+    def _build_team_composition_context(
+        self,
+        task: TaskRun,
+        runtime: CompositionRuntime,
+        *,
+        allow_snapshot_resume: bool = False,
+        include_user_clarification: bool = False,
+    ) -> CompositionContext:
+        """Build the truthful runtime composition context from current session state."""
+
+        state = self._state(task.id)
+        if allow_snapshot_resume:
+            restored = self._restore_composition_context_snapshot(task.id)
+            if restored is not None:
+                context = restored.model_copy(deep=True)
+                if include_user_clarification:
+                    clarification = state.get("user_clarification") if isinstance(state.get("user_clarification"), dict) else {}
+                    answer = clarification.get("answer")
+                    if isinstance(answer, str) and answer.strip():
+                        note = f"User clarification: {answer.strip()}"
+                        if note not in context.unresolved_user_requirements:
+                            context.unresolved_user_requirements.append(note)
+                return context
+        brief = state.get("working_brief") if isinstance(state.get("working_brief"), dict) else {}
+        coordination = state.get("team_coordination_brief") if isinstance(state.get("team_coordination_brief"), dict) else {}
+        acceptance_requirements: list[str] = []
+        acceptance_requirements.extend(str(item) for item in brief.get("success_criteria", []) if str(item).strip())
+        acceptance_requirements.extend(str(item) for item in coordination.get("dependencies", []) if str(item).strip())
+        required_capabilities: list[str] = []
+        seen_capabilities: set[str] = set()
+        for item in coordination.get("proposed_subtasks", []):
+            if not isinstance(item, dict):
+                continue
+            for capability in item.get("required_capabilities", []):
+                text = str(capability).strip()
+                if text and text not in seen_capabilities:
+                    seen_capabilities.add(text)
+                    required_capabilities.append(text)
+        readiness = state.get("readiness_tally") if isinstance(state.get("readiness_tally"), dict) else {}
+        unresolved_user_requirements = [
+            str(item)
+            for item in readiness.get("open_questions", [])
+            if str(item).strip()
+        ]
+        return runtime.build_composition_context(
+            task.id,
+            task.prompt,
+            acceptance_requirements,
+            required_capabilities=required_capabilities,
+            unresolved_user_requirements=unresolved_user_requirements,
+        )
+
+    def _persist_team_composition_plan(
+        self,
+        task_id: str,
+        result: Any,
+        availability_blockers: list[dict[str, Any]],
+    ) -> None:
+        """Persist the selected validated composition plan and metadata."""
+
+        composition = self._team_composition_state(task_id)
+        composition.update({
+            "status": "validated",
+            "attempt_count": int(getattr(result, "attempt_count", 0)),
+            "recomposed": bool(getattr(result, "recomposed", False)),
+            "validation_issue_history": [
+                [issue.model_dump(mode="json") for issue in issue_group]
+                for issue_group in getattr(result, "validation_issue_history", [])
+            ],
+            "selected_plan": result.plan.model_dump(mode="json"),
+            "availability_blockers": availability_blockers,
+            "blocked": None,
+        })
+
+    def _pause_for_team_composition(
+        self,
+        task: TaskRun,
+        team: Team,
+        blocked: TeamCompositionBlocked,
+    ) -> None:
+        """Pause through the existing clarification flow for missing user input."""
+
+        state = self._state(task.id)
+        composition = self._team_composition_state(task.id)
+        issue_messages = [issue.message for issue in blocked.issues]
+        question = issue_messages[0] if issue_messages else str(blocked)
+        blocked_payload = {
+            "category": blocked.category,
+            "message": str(blocked),
+            "issues": [issue.model_dump(mode="json") for issue in blocked.issues],
+            "validation_issue_history": [
+                [issue.model_dump(mode="json") for issue in issue_group]
+                for issue_group in blocked.validation_issue_history
+            ],
+        }
+        composition.update({
+            "status": "waiting_for_user",
+            "blocked": blocked_payload,
+            "resume_used": False,
+        })
+        payload = {
+            "question": question,
+            "blockers": issue_messages,
+            "open_questions": issue_messages,
+            "resume_phase": "team_composition",
+            "team_id": team.id,
+            "team_member_ids": list(team.member_ids),
+            "voter_ids": self._voter_ids(team),
+            "team_leader_id": team.leader_id,
+            "task_prompt": task.prompt,
+            "working_brief": copy.deepcopy(state.get("working_brief")),
+            "team_coordination_brief": copy.deepcopy(state.get("team_coordination_brief")),
+            "readiness_tally": copy.deepcopy(state.get("readiness_tally", {})),
+            "composition_state": copy.deepcopy(composition),
+        }
+        state["resume_phase"] = "team_composition"
+        state["phase"] = "waiting_for_user"
+        state["user_clarification"] = {"status": "requested", **payload}
+        task.status = "waiting_for_user"
+        task.updated_at = now_iso()
+        self._emit(
+            task.id,
+            "user_clarification_requested",
+            "The typed team composition phase needs user clarification before execution can continue.",
+            payload=payload,
+        )
+
+    def _fail_team_composition(
+        self,
+        task: TaskRun,
+        *,
+        blocking_reason: str,
+        category: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a truthful terminal failure for composition without fallback."""
+
+        task.status = "failed"
+        task.updated_at = now_iso()
+        state = self._state(task.id)
+        composition = self._team_composition_state(task.id)
+        composition["status"] = "failed"
+        if details:
+            composition["blocked"] = copy.deepcopy(details)
+        diagnosis = self._diagnose_failure(task.id)
+        failure_payload = {
+            "phase": "team_composition",
+            "blocking_reason": blocking_reason,
+            "missing_inputs": diagnosis["missing_inputs"],
+            "missing_evidence": diagnosis["missing_evidence"],
+            "system_error": blocking_reason,
+            "recoverable": False,
+            "blocker_category": category,
+        }
+        if details:
+            failure_payload["details"] = details
+        self._emit(
+            task.id,
+            "run_failed",
+            f"Run failed during team composition: {blocking_reason}",
+            payload=failure_payload,
+        )
+        self._emit(
+            task.id,
+            "task_failed",
+            blocking_reason,
+            payload={
+                "phase": "team_composition",
+                "error": blocking_reason,
+                "blocker_category": category,
+            },
+        )
+
+    def _record_composition_subtasks(
+        self,
+        task: TaskRun,
+        team: Team,
+        result: Any,
+    ) -> None:
+        """Map composed work nodes into durable session subtasks and events."""
+
+        state = self._state(task.id)
+        composition = self._team_composition_state(task.id)
+        selected_plan = composition.get("selected_plan") or {}
+        assignments_by_id = {
+            str(item.get("id")): item
+            for item in selected_plan.get("assignments", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        nodes_by_id = {
+            str(item.get("id")): item
+            for item in selected_plan.get("work_graph", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        materialized_by_assignment = {
+            str(item.get("assignment_id")): item
+            for item in composition.get("materialized_agents", [])
+            if isinstance(item, dict) and item.get("assignment_id")
+        }
+        composed_subtasks: list[dict[str, Any]] = []
+        leader_id = team.leader_id or (team.member_ids[0] if team.member_ids else None)
+        for node_id, runtime_record in result.graph_result.nodes.items():
+            assignment = assignments_by_id.get(str(runtime_record.assignment_id), {})
+            node = nodes_by_id.get(str(node_id), {})
+            materialized = materialized_by_assignment.get(str(runtime_record.assignment_id), {})
+            output = result.node_outputs.get(node_id, {})
+            artifact_refs = result.node_artifact_refs.get(node_id, [])
+            attempt_records = [attempt.model_dump(mode="json") for attempt in runtime_record.attempts]
+            terminal_attempt = attempt_records[-1] if attempt_records else {}
+            blockers = [str(item) for item in runtime_record.blocked_dependency_ids]
+            if terminal_attempt.get("message"):
+                blockers.append(str(terminal_attempt["message"]))
+            status = str(runtime_record.status)
+            result_summary = ""
+            if isinstance(output, dict) and output:
+                result_summary = json.dumps(output, sort_keys=True)[:240]
+            elif terminal_attempt.get("message"):
+                result_summary = str(terminal_attempt["message"])[:240]
+            elif blockers:
+                result_summary = "; ".join(blockers)[:240]
+            subtask = {
+                "id": str(node_id),
+                "assignment_id": str(runtime_record.assignment_id),
+                "agent_id": str(materialized.get("id") or assignment.get("agent_template_id") or runtime_record.assignment_id),
+                "agent_template_id": str(materialized.get("template_id") or assignment.get("agent_template_id") or ""),
+                "execution_agent_id": str(materialized.get("id") or ""),
+                "subtask": str(assignment.get("objective") or ""),
+                "status": status,
+                "outcome_status": status,
+                "result_summary": result_summary,
+                "outcome_summary": result_summary,
+                "blockers": blockers,
+                "evidence_refs": [str(item) for item in artifact_refs],
+                "artifact_refs": [str(item) for item in artifact_refs],
+                "outputs": copy.deepcopy(output),
+                "depends_on": [str(item) for item in node.get("depends_on", [])],
+                "conflict_domains": [str(item) for item in node.get("conflict_domains", [])],
+                "required_capabilities": [str(item) for item in assignment.get("required_capabilities", [])],
+                "tool_grants": copy.deepcopy(assignment.get("tool_grants", [])),
+                "owned_paths": [str(item) for item in assignment.get("owned_paths", [])],
+                "expected_artifacts": [str(item) for item in assignment.get("expected_artifacts", [])],
+                "done_criteria": [str(item) for item in assignment.get("acceptance_checks", [])],
+                "attempt_count": len(attempt_records),
+                "attempts": attempt_records,
+                "provenance": "team_composition",
+                "source": "team_composition",
+                "blocking_if_missing": True,
+            }
+            composed_subtasks.append(subtask)
+            self._emit(
+                task.id,
+                "delegation_assigned",
+                f"Typed team composition assigned work node {node_id} for execution.",
+                actor=leader_id,
+                payload={
+                    "subtask_id": subtask["id"],
+                    "agent_id": subtask["agent_id"],
+                    "assigned_by": leader_id,
+                    "objective": subtask["subtask"],
+                    "why_assigned": "Validated team composition plan.",
+                    "done_criteria": subtask["done_criteria"],
+                    "blocking_if_missing": True,
+                    "required_capabilities": subtask["required_capabilities"],
+                    "provenance": "team_composition",
+                    "status": "assigned",
+                },
+            )
+            self._emit(
+                task.id,
+                "delegation_reported",
+                f"Typed team composition reported terminal status for work node {node_id}.",
+                actor=subtask["agent_id"],
+                payload={
+                    "subtask_id": subtask["id"],
+                    "agent_id": subtask["agent_id"],
+                    "status": subtask["status"],
+                    "result_summary": subtask["result_summary"],
+                    "blockers": subtask["blockers"],
+                    "outcome_status": subtask["outcome_status"],
+                    "outcome_summary": subtask["outcome_summary"],
+                    "evidence_refs": subtask["evidence_refs"],
+                    "provenance": "team_composition",
+                },
+            )
+        state["subtasks"] = composed_subtasks
+
+    async def _run_team_composition_phase(
+        self,
+        task: TaskRun,
+        team: Team,
+        *,
+        allow_started_resume: bool = False,
+    ) -> str:
+        """Compose and execute the accepted typed team plan when enabled."""
+
+        if not self._should_run_team_composition(task.id, allow_started_resume=allow_started_resume):
+            return "disabled"
+        state = self._state(task.id)
+        composition = self._team_composition_state(task.id)
+        composition["status"] = "running"
+        state["phase"] = "team_composition"
+        runtime = self._create_composition_runtime(task.id)
+        context = self._build_team_composition_context(
+            task,
+            runtime,
+            allow_snapshot_resume=allow_started_resume,
+            include_user_clarification=allow_started_resume,
+        )
+        context_snapshot = self._serialize_composition_context(context)
+        if context_snapshot is not None:
+            composition["context_snapshot"] = context_snapshot
+        availability = runtime.available_tool_ids()
+        composition["availability_blockers"] = [
+            blocker.model_dump(mode="json") for blocker in availability.blockers
+        ]
+        try:
+            if self._is_legacy_composition_resume(task.id):
+                composition["selection_strategy"] = "legacy_composer"
+                composer = self._create_team_composer(task.id)
+                composed = await composer.compose(context)
+            else:
+                composition["selection_strategy"] = "fixed_specialists"
+                composed = await self._select_fixed_specialist_plan(task, team, context, runtime)
+        except SpecialistSelectionError as exc:
+            details = {
+                "category": "fixed_specialist_selection_blocked",
+                "message": str(exc),
+                "blockers": [blocker.model_dump(mode="json") for blocker in exc.blockers],
+            }
+            composition["blocked"] = details
+            self._fail_team_composition(
+                task,
+                blocking_reason=str(exc),
+                category="fixed_specialist_selection_blocked",
+                details=details,
+            )
+            return "failed"
+        except GovernanceToolError as exc:
+            details = {"code": "leader_specialist_tool_failed", "message": str(exc)}
+            composition["blocked"] = details
+            self._fail_team_composition(
+                task,
+                blocking_reason=str(exc),
+                category="provider_system_blocker",
+                details=details,
+            )
+            return "failed"
+        except TeamCompositionBlocked as exc:
+            blocked_details = {
+                "category": exc.category,
+                "message": str(exc),
+                "issues": [issue.model_dump(mode="json") for issue in exc.issues],
+                "validation_issue_history": [
+                    [issue.model_dump(mode="json") for issue in issue_group]
+                    for issue_group in exc.validation_issue_history
+                ],
+            }
+            composition["blocked"] = blocked_details
+            if exc.category == "missing_user_input":
+                self._pause_for_team_composition(task, team, exc)
+                return "paused"
+            self._fail_team_composition(
+                task,
+                blocking_reason=str(exc),
+                category=exc.category,
+                details=blocked_details,
+            )
+            return "failed"
+        except TeamCompositionProviderError as exc:
+            details = {"code": exc.code, "message": str(exc)}
+            composition["blocked"] = details
+            self._fail_team_composition(
+                task,
+                blocking_reason=str(exc),
+                category="provider_system_blocker",
+                details=details,
+            )
+            return "failed"
+
+        self._persist_team_composition_plan(
+            task.id,
+            composed,
+            [blocker.model_dump(mode="json") for blocker in availability.blockers],
+        )
+        cancellation_event = asyncio.Event()
+        self._composition_cancellation_events[task.id] = cancellation_event
+        try:
+            execution = await runtime.execute_plan(
+                composed.plan,
+                task.id,
+                task.prompt,
+                session_state=state,
+                global_cancellation_event=cancellation_event,
+            )
+        finally:
+            self._composition_cancellation_events.pop(task.id, None)
+        composition.update({
+            "materialized_agents": [item.model_dump(mode="json") for item in execution.materialized_agents],
+            "execution_result": execution.model_dump(mode="json"),
+            "availability_blockers": [item.model_dump(mode="json") for item in execution.availability_blockers],
+        })
+        state["composition_execution_roster"] = copy.deepcopy(composition["materialized_agents"])
+        self._record_composition_subtasks(task, team, execution)
+        terminal_status = str(execution.graph_result.terminal_status)
+        composition["status"] = terminal_status
+        if terminal_status != "completed":
+            interruption = state.get("interruption") if isinstance(state.get("interruption"), dict) else {}
+            if interruption.get("reason") == "graceful_shutdown" and terminal_status == "canceled":
+                return "failed"
+            self._fail_team_composition(
+                task,
+                blocking_reason=f"Composed execution ended with {terminal_status}.",
+                category=f"composition_execution_{terminal_status}",
+                details={"execution_result": execution.model_dump(mode="json")},
+            )
+            return "failed"
+        state["phase"] = "delegating"
+        return "completed"
+
+    async def _continue_after_execution(self, task: TaskRun, team: Team, start_time: float) -> None:
+        """Run the unchanged legacy post-delegation governance and final flow."""
+
+        if self.settings.efficient_society_enabled:
+            proposals = await self._negotiate_efficient(task, team)
+            self._emit(
+                task.id,
+                "efficient_phase_skipped",
+                "The critic counterproposal replaced a separate all-member opinion round.",
+                payload={"phase": "proposal_opinions", "reason": "counterproposal_is_bounded_review"},
+            )
+        else:
+            proposals = await self._negotiate(task, team)
+            await self._collect_proposal_opinions(task, team, proposals)
+        winner = await self._vote(task, team, proposals)
+        if winner is None:
+            return
+        await self._complete_after_vote(task, team, winner, proposals, start_time)
+
     async def _run_pre_execution_conversation(self, task: TaskRun, team: Team) -> None:
         """Run goal discussion and readiness loop before leader election when enabled."""
 
@@ -767,9 +2417,14 @@ class SocietyOrchestrator:
         for attempt in range(1, max_readiness_attempts + 1):
             state["readiness_attempt_count"] = attempt
             await self._run_goal_discussion_round(task, team, max_discussion_rounds)
-            await self._run_targeted_question_exchange(task, team)
+            if not self.settings.efficient_society_enabled:
+                await self._run_targeted_question_exchange(task, team)
             if self.settings.readiness_voting_enabled:
-                passed = await self._run_readiness_vote(task, team, attempt)
+                if self.settings.efficient_society_enabled:
+                    ballot_results = self._combined_discussion_readiness_ballots(task, team, attempt)
+                    passed = await self._run_readiness_vote(task, team, attempt, ballot_results)
+                else:
+                    passed = await self._run_readiness_vote(task, team, attempt)
                 if passed:
                     break
                 if attempt == max_readiness_attempts:
@@ -814,13 +2469,14 @@ class SocietyOrchestrator:
                 for turn in prior_turns
             ) or "- You are the first speaker. Frame the problem briefly and ask the next agent a useful question."
             previous_agent = prior_turns[-1].get("agent_id") if prior_turns else None
-            statement = await self._run_governance_tool(
-                task=task,
-                actor_identity=agent,
-                tool_func=submit_goal_discussion_tool,
-                tool_name="submit_goal_discussion",
-                schema_class=GoalDiscussionStatement,
-                prompt=(
+            try:
+                statement = await self._run_governance_tool(
+                    task=task,
+                    actor_identity=agent,
+                    tool_func=submit_goal_discussion_tool,
+                    tool_name="submit_goal_discussion",
+                    schema_class=GoalDiscussionStatement,
+                    prompt=(
                     f"Task: {task.prompt}\n"
                     f"Your exact agent_id is {agent_id}.\n"
                     f"Discussion round: {round_num}.\n"
@@ -837,9 +2493,34 @@ class SocietyOrchestrator:
                     "Set spoken_turn to one or two short sentences that sound like a teammate in a meeting. "
                     "The spoken turn must respond to the previous speaker when there is one. "
                     "Ask question_for_next when the next agent should resolve something. "
-                    "Call submit_goal_discussion with your exact agent_id."
-                ),
-            )
+                    "Also cast your readiness decision in this same tool call. Set ready=false and "
+                    "critical_blocker=true only for missing_user_input, missing_system_capability, "
+                    "or safety_or_policy. Future work and ordinary risk do not block execution. "
+                    "When blocked, include blocker_category, required_clarification, blocker_owner, "
+                    "and blocker_remediation. "
+                        "Call submit_goal_discussion with your exact agent_id."
+                    ),
+                )
+            except GovernanceToolError as exc:
+                # Do not turn a transport failure into a fabricated employee
+                # contribution. Preserve the failure as a system fact and let
+                # the remaining employees continue their real discussion.
+                self._emit(
+                    task.id,
+                    "agent_contribution_unavailable",
+                    f"{agent.name}'s discussion contribution was unavailable.",
+                    actor=agent_id,
+                    payload={"phase": "goal_discussion", "reason": str(exc)[:300]},
+                )
+                continue
+            live_discussions = state.setdefault("goal_discussions", [])
+            if not any(
+                isinstance(item, dict)
+                and item.get("round") == statement.round
+                and item.get("agent_id") == statement.agent_id
+                for item in live_discussions
+            ):
+                live_discussions.append(statement.model_dump())
             self._emit(task.id, "agent_goal_opinion", f"{agent.name} shared their view of the goal.", actor=agent_id, payload=statement.model_dump())
             self._record_conversation_turn(task.id, statement, len(prior_turns) + 1, prior_turns[-1] if prior_turns else None)
             self._record_position_from_discussion(task.id, statement)
@@ -973,22 +2654,90 @@ class SocietyOrchestrator:
         question = f" My question for the next speaker: {statement.question_for_next}" if statement.question_for_next else ""
         return f"{opener}{reference} {contribution}{question}".strip()
 
-    async def _run_readiness_vote(self, task: TaskRun, team: Team, attempt: int) -> bool:
+    def _combined_discussion_readiness_ballots(
+        self,
+        task: TaskRun,
+        team: Team,
+        attempt: int,
+    ) -> list[tuple[str, ReadinessBallot]]:
+        """Build ballots from each agent's actual combined discussion response."""
+
+        state = self._state(task.id)
+        round_num = state.get("discussion_round_count")
+        latest_by_agent = {
+            str(item.get("agent_id")): item
+            for item in state.get("goal_discussions", [])
+            if isinstance(item, dict) and item.get("round") == round_num
+        }
+        results: list[tuple[str, ReadinessBallot]] = []
+        for agent_id in self._voter_ids(team):
+            item = latest_by_agent.get(agent_id)
+            if item is None:
+                continue
+            statement = GoalDiscussionStatement.model_validate(item)
+            results.append((agent_id, ReadinessBallot(
+                attempt=attempt,
+                agent_id=agent_id,
+                ready=statement.ready,
+                critical_blocker=statement.critical_blocker,
+                reason=statement.unique_contribution or statement.interpretation,
+                required_clarification=statement.required_clarification,
+                blocker_category=statement.blocker_category,
+                owner=statement.blocker_owner or agent_id,
+                phase="pre_execution",
+                remediation=statement.blocker_remediation,
+            )))
+        return results
+
+    async def _run_readiness_vote(
+        self,
+        task: TaskRun,
+        team: Team,
+        attempt: int,
+        ballot_results: list[tuple[str, ReadinessBallot]] | None = None,
+    ) -> bool:
         """Collect readiness ballots from each team member and tally."""
 
         state = self._state(task.id)
-        ballot_results = await self._collect_readiness_ballots_concurrent(task, team, attempt)
+        combined = ballot_results is not None
+        if ballot_results is None:
+            ballot_results = await self._collect_readiness_ballots_concurrent(task, team, attempt)
         ready_count = 0
         not_ready_count = 0
         blockers: list[str] = []
+        structured_blockers: list[ReadinessBlocker] = []
         for agent_id, ballot in ballot_results:
             agent = self.agents[agent_id]
+            if ballot.critical_blocker and not _is_structured_execution_blocker(ballot):
+                original = ballot.model_dump()
+                ballot = ballot.model_copy(update={
+                    "ready": True,
+                    "critical_blocker": False,
+                    "required_clarification": None,
+                    "reason": (
+                        "Ready for execution; the original objection is not a blocking category."
+                    ),
+                })
+                self._emit(
+                    task.id,
+                    "readiness_blocker_reclassified",
+                    "A non-blocking readiness objection was reclassified.",
+                    actor=agent_id,
+                    payload={"original_ballot": original, "effective_ballot": ballot.model_dump()},
+                )
             if ballot.ready:
                 ready_count += 1
             else:
                 not_ready_count += 1
             if ballot.critical_blocker:
                 blockers.append(f"{agent_id}: {ballot.reason}")
+                structured_blockers.append(ReadinessBlocker(
+                    category=ballot.blocker_category or "missing_user_input",
+                    owner=ballot.owner or agent_id,
+                    phase=ballot.phase or "pre_execution",
+                    remediation=ballot.remediation or ballot.required_clarification or "Resolve the blocker before execution.",
+                    reason=ballot.reason,
+                ))
                 self._record_objection(
                     task.id,
                     ObjectionRecord(
@@ -1006,7 +2755,7 @@ class SocietyOrchestrator:
                 agent_id,
                 f"attempt={attempt}",
                 ballot.model_dump(),
-                "native_agno",
+                "deterministic_no_key" if combined else "native_agno",
                 not ballot.reason.startswith("Recovered from readiness tool issue"),
             )
         total = ready_count + not_ready_count
@@ -1018,6 +2767,7 @@ class SocietyOrchestrator:
             total=total,
             passed=passed,
             blockers=blockers,
+            structured_blockers=structured_blockers,
         )
         state["readiness_tally"] = tally.model_dump()
         state["ready_to_proceed"] = passed if passed else state.get("ready_to_proceed")
@@ -1039,7 +2789,7 @@ class SocietyOrchestrator:
         """
 
         state = self._state(task.id)
-        roster = list(team.member_ids)
+        roster = self._voter_ids(team)
         limit = max(1, int(self.settings.readiness_concurrency))
         semaphore = asyncio.Semaphore(limit)
 
@@ -1064,6 +2814,16 @@ class SocietyOrchestrator:
                 f"Your latest discussion statement: {latest_statement}\n"
                 "Vote whether the society is ready to execute. "
                 "Set critical_blocker=true only if execution would be misleading without user clarification. "
+                "When critical_blocker=true, set blocker_category to one of: "
+                "missing_user_input, missing_system_capability, safety_or_policy, future_work, risk. "
+                "Only missing_user_input, missing_system_capability, and safety_or_policy block execution. "
+                "future_work and risk are recorded but do not block. "
+                "Set owner to the agent or role responsible, phase to the relevant phase, "
+                "and remediation to what must happen to resolve the blocker. "
+                "Do not block because research, implementation, validation, votes, or final artifacts are not yet complete; "
+                "those are future_work, not blocking prerequisites. "
+                "Block only for ambiguous user intent, contradictory constraints, "
+                "unavailable required capabilities, or a decision that only the user can make. "
                 "Call cast_readiness_vote with your exact agent_id."
             )
             async with semaphore:
@@ -1102,7 +2862,7 @@ class SocietyOrchestrator:
         """
 
         state = self._state(task.id)
-        roster = list(team.member_ids)
+        roster = self._voter_ids(team)
         limit = max(1, int(self.settings.readiness_concurrency))
         semaphore = asyncio.Semaphore(limit)
         summary = "\n".join(f"- {cid}: {self.agents[cid].name}, role={self.agents[cid].role}" for cid in candidates)
@@ -1271,6 +3031,14 @@ class SocietyOrchestrator:
 
         if not self.settings.social_tools_enabled:
             return
+        if self.settings.efficient_society_enabled:
+            self._emit(
+                task.id,
+                "efficient_phase_skipped",
+                "Skipped repeated working-brief positions; readiness ballots already captured every voter's stance.",
+                payload={"phase": "working_brief_positions", "replacement": "readiness_ballots"},
+            )
+            return
         state = self._state(task.id)
         brief = state.get("working_brief")
         if not isinstance(brief, dict):
@@ -1305,13 +3073,14 @@ class SocietyOrchestrator:
                     True,
                 )
                 continue
-            position = await self._run_governance_tool(
-                task=task,
-                actor_identity=agent,
-                tool_func=state_position_tool,
-                tool_name="state_position",
-                schema_class=AgentPosition,
-                prompt=(
+            try:
+                position = await self._run_governance_tool(
+                    task=task,
+                    actor_identity=agent,
+                    tool_func=state_position_tool,
+                    tool_name="state_position",
+                    schema_class=AgentPosition,
+                    prompt=(
                     f"Task: {task.prompt}\n"
                     f"Your exact agent_id is {agent_id}.\n"
                     f"Working brief summary: {brief_summary}\n"
@@ -1320,9 +3089,12 @@ class SocietyOrchestrator:
                     "State your public position on this working brief. "
                     "Use stance support, oppose, uncertain, defer, or block. "
                     "Choose block only for a critical issue that should stop execution. "
-                    "Call state_position with phase='working_brief' and your exact agent_id."
-                ),
-            )
+                        "Call state_position with phase='working_brief' and your exact agent_id."
+                    ),
+                )
+            except GovernanceToolError as exc:
+                self._emit(task.id, "agent_contribution_unavailable", f"{agent.name}'s brief position was unavailable.", actor=agent_id, payload={"phase": "working_brief", "reason": str(exc)[:300]})
+                continue
             if self.settings.social_trace_enabled:
                 self._emit(
                     task.id,
@@ -1336,6 +3108,14 @@ class SocietyOrchestrator:
         """Let each agent keep a private reservation and publish only useful notes."""
 
         if not self.settings.social_tools_enabled:
+            return
+        if self.settings.efficient_society_enabled:
+            self._emit(
+                task.id,
+                "efficient_phase_skipped",
+                "Skipped private-note model calls in efficient mode; blockers remain visible in readiness evidence.",
+                payload={"phase": "private_notes", "replacement": "readiness_blockers"},
+            )
             return
         state = self._state(task.id)
         brief = state.get("working_brief")
@@ -1371,13 +3151,14 @@ class SocietyOrchestrator:
                     )
                 continue
 
-            note = await self._run_governance_tool(
-                task=task,
-                actor_identity=agent,
-                tool_func=record_private_note_tool,
-                tool_name="record_private_note",
-                schema_class=PrivateNote,
-                prompt=(
+            try:
+                note = await self._run_governance_tool(
+                    task=task,
+                    actor_identity=agent,
+                    tool_func=record_private_note_tool,
+                    tool_name="record_private_note",
+                    schema_class=PrivateNote,
+                    prompt=(
                     f"Task: {task.prompt}\n"
                     f"Your exact agent_id is {agent_id}.\n"
                     f"Working brief summary: {brief_summary}\n"
@@ -1386,9 +3167,12 @@ class SocietyOrchestrator:
                     "Record a short private note before execution. "
                     "This is your private scratchpad: name a reservation, evidence gap, handoff risk, or focus area. "
                     "Set may_publish=true only if the team should see the note before work starts. "
-                    "Call record_private_note with phase='working_brief' and your exact agent_id."
-                ),
-            )
+                        "Call record_private_note with phase='working_brief' and your exact agent_id."
+                    ),
+                )
+            except GovernanceToolError as exc:
+                self._emit(task.id, "agent_contribution_unavailable", f"{agent.name}'s private note was unavailable.", actor=agent_id, payload={"phase": "working_brief", "reason": str(exc)[:300]})
+                continue
             if note.may_publish:
                 published = await self._run_governance_tool(
                     task=task,
@@ -1510,6 +3294,108 @@ class SocietyOrchestrator:
                 }
         return snapshot
 
+    def _capture_model_usage(
+        self,
+        task_id: str,
+        response: Any,
+        call_kind: str,
+        actor_id: str,
+    ) -> None:
+        """Capture factual Agno RunOutput.metrics for benchmark accounting.
+
+        Reads ``response.metrics.to_dict()`` when present and appends a usage
+        record to ``session_state['model_usage']``.  Tolerates missing or
+        partial metrics without raising.  Does not alter the response, returned
+        values, or error propagation.
+
+        Each record stores: task_id, call_kind, actor_id, model,
+        model_provider, input/output/total/cache_read/cache_write/reasoning
+        tokens, cost, duration, time_to_first_token, and a ``metrics_present``
+        flag that is *True* only when the response carried a non-empty metrics
+        dict.
+        """
+
+        state = self._state(task_id)
+        usage_log: list[dict] = state.setdefault("model_usage", [])
+        record: dict[str, Any] = {
+            "task_id": task_id,
+            "call_kind": call_kind,
+            "actor_id": actor_id,
+            "model": None,
+            "model_provider": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "cost": None,
+            "duration": 0.0,
+            "time_to_first_token": 0.0,
+            "metrics_present": False,
+        }
+        metrics_obj = getattr(response, "metrics", None)
+        if metrics_obj is not None:
+            try:
+                raw = metrics_obj.to_dict() if callable(getattr(metrics_obj, "to_dict", None)) else {}
+            except Exception:
+                raw = {}
+            if raw and isinstance(raw, dict):
+                record["metrics_present"] = True
+                record["model"] = raw.get("model") or raw.get("model_id")
+                record["model_provider"] = raw.get("model_provider") or raw.get("provider")
+                record["input_tokens"] = int(raw.get("input_tokens") or raw.get("prompt_tokens") or 0)
+                record["output_tokens"] = int(raw.get("output_tokens") or raw.get("completion_tokens") or 0)
+                record["total_tokens"] = int(raw.get("total_tokens") or (record["input_tokens"] + record["output_tokens"]))
+                record["cache_read_tokens"] = int(raw.get("cache_read_input_tokens") or raw.get("cache_read_tokens") or 0)
+                record["cache_write_tokens"] = int(raw.get("cache_creation_input_tokens") or raw.get("cache_write_tokens") or 0)
+                record["reasoning_tokens"] = int(raw.get("reasoning_tokens") or 0)
+                if "cost" in raw:
+                    record["cost"] = float(raw["cost"])
+                elif "total_cost" in raw:
+                    record["cost"] = float(raw["total_cost"])
+                record["duration"] = float(raw.get("duration") or raw.get("response_time") or 0.0)
+                record["time_to_first_token"] = float(raw.get("time_to_first_token") or raw.get("ttft") or 0.0)
+        fallback_model = getattr(response, "model", None) or getattr(response, "model_id", None)
+        if fallback_model and not record["model"]:
+            record["model"] = str(fallback_model)
+        fallback_provider = getattr(response, "model_provider", None)
+        if fallback_provider and not record["model_provider"]:
+            record["model_provider"] = str(fallback_provider)
+        usage_log.append(record)
+
+    def model_usage_summary(self, task_id: str) -> dict:
+        """Deterministically sum model-usage calls for *task_id*.
+
+        Returns a dict with aggregate calls, token counts, cost, and duration.
+        ``usage_complete`` is *False* only when at least one successful model
+        response lacked metrics data (``metrics_present`` is *False*).  When
+        no calls have been recorded the summary is zeroed and ``usage_complete``
+        is *True* (nothing is missing).
+        """
+
+        state = self._state(task_id)
+        records: list[dict] = state.get("model_usage", [])
+        total_calls = len(records)
+        return {
+            "task_id": task_id,
+            "total_calls": total_calls,
+            "input_tokens": sum(r.get("input_tokens", 0) for r in records),
+            "output_tokens": sum(r.get("output_tokens", 0) for r in records),
+            "total_tokens": sum(r.get("total_tokens", 0) for r in records),
+            "cache_read_tokens": sum(r.get("cache_read_tokens", 0) for r in records),
+            "cache_write_tokens": sum(r.get("cache_write_tokens", 0) for r in records),
+            "reasoning_tokens": sum(r.get("reasoning_tokens", 0) for r in records),
+            "cost": (
+                sum(r["cost"] for r in records)
+                if records and all(r.get("cost") is not None for r in records)
+                else None
+            ),
+            "cost_complete": bool(records) and all(r.get("cost") is not None for r in records),
+            "duration": sum(r.get("duration", 0.0) for r in records),
+            "usage_complete": not any(not r.get("metrics_present", False) for r in records),
+        }
+
     async def _run_governance_tool(
         self,
         task: TaskRun,
@@ -1543,75 +3429,46 @@ class SocietyOrchestrator:
             session_state=self._state(task.id),
         )
 
+        result_mode = "native_agno"
         try:
-            response = await asyncio.wait_for(
-                agno_agent.arun(prompt),
-                timeout=self.settings.llm_timeout_seconds,
+            response = await self._call_provider(
+                lambda: agno_agent.arun(prompt),
+                task_id=task.id,
+                actor=actor_identity.id,
+                operation=tool_name,
             )
         except asyncio.TimeoutError as exc:
-            if schema_class is GoalDiscussionStatement:
-                result = _fallback_goal_discussion(task, actor_identity, prompt, str(exc))
-                self._state(task.id).setdefault("goal_discussions", []).append(result.model_dump())
-                self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], result.model_dump(), "native_agno", False)
-                return result
-            if schema_class is ReadinessBallot:
-                result = _fallback_readiness_ballot(actor_identity, str(exc))
-                self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], result.model_dump(), "native_agno", False)
-                return result
-            if schema_class is AgentPosition:
-                result = _fallback_agent_position(actor_identity, self._state(task.id).get("phase", "unknown"), str(exc))
-                self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], result.model_dump(), "native_agno", False)
-                return result
-            if schema_class is PrivateNote:
-                result = _fallback_private_note(actor_identity, self._state(task.id).get("phase", "unknown"), str(exc))
-                self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], result.model_dump(), "native_agno", False)
-                return result
             self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], {}, "native_agno", False)
             raise GovernanceToolError(f"Timeout calling {tool_name}: {exc}") from exc
         except Exception as exc:
             self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], {}, "native_agno", False)
             raise GovernanceToolError(f"Agent run failed for {tool_name}: {exc}") from exc
 
+        self._capture_model_usage(task.id, response, "governance_tool", actor_identity.id)
         try:
             result = _extract_tool_result(response, tool_name, schema_class)
         except ValueError as exc:
-            retry_prompt = (
-                f"{prompt}\n\n"
-                f"Your previous response did not call the required `{tool_name}` tool. "
-                f"Retry now and call `{tool_name}` exactly once. "
-                "Do not explain, summarize, or answer in prose outside the tool call."
-            )
+            retry_prompt = f"{prompt}\n\n{_json_only_retry_instruction(tool_name, schema_class)}"
             try:
-                retry_response = await asyncio.wait_for(
-                    agno_agent.arun(retry_prompt),
-                    timeout=self.settings.llm_timeout_seconds,
+                retry_response = await self._call_provider(
+                    lambda: agno_agent.arun(retry_prompt),
+                    task_id=task.id,
+                    actor=actor_identity.id,
+                    operation=f"{tool_name}_structured_retry",
                 )
+                self._capture_model_usage(task.id, retry_response, "governance_tool_retry", actor_identity.id)
                 result = _extract_tool_result(retry_response, tool_name, schema_class)
             except (asyncio.TimeoutError, ValueError) as retry_exc:
-                if schema_class is GoalDiscussionStatement:
-                    result = _fallback_goal_discussion(task, actor_identity, retry_prompt, str(retry_exc))
-                    self._state(task.id).setdefault("goal_discussions", []).append(result.model_dump())
-                    self._emit_tool_call(
-                        task.id,
-                        tool_name,
-                        actor_identity.id,
-                        retry_prompt[:200],
-                        {"recovered": True, "reason": str(retry_exc)[:300], **result.model_dump()},
-                        "native_agno",
-                        False,
+                try:
+                    result = await self._run_schema_json_retry(
+                        task, actor_identity, tool_name, schema_class, prompt
                     )
-                    return result
-                if schema_class is ReadinessBallot:
-                    result = _fallback_readiness_ballot(actor_identity, str(retry_exc))
-                    self._emit_tool_call(task.id, tool_name, actor_identity.id, retry_prompt[:200], result.model_dump(), "native_agno", False)
-                    return result
-                if schema_class is AgentPosition:
-                    result = _fallback_agent_position(actor_identity, self._state(task.id).get("phase", "unknown"), str(retry_exc))
-                    self._emit_tool_call(task.id, tool_name, actor_identity.id, retry_prompt[:200], result.model_dump(), "native_agno", False)
-                    return result
-                if schema_class is PrivateNote:
-                    result = _fallback_private_note(actor_identity, self._state(task.id).get("phase", "unknown"), str(retry_exc))
-                    self._emit_tool_call(task.id, tool_name, actor_identity.id, retry_prompt[:200], result.model_dump(), "native_agno", False)
+                    result_mode = "structured_output_recovered"
+                except (asyncio.TimeoutError, ValueError) as json_retry_exc:
+                    retry_exc = json_retry_exc
+                else:
+                    result_dict = result.model_dump()
+                    self._emit_tool_call(task.id, tool_name, actor_identity.id, retry_prompt[:200], result_dict, result_mode, True)
                     return result
                 self._emit_tool_call(task.id, tool_name, actor_identity.id, retry_prompt[:200], {}, "native_agno", False)
                 raise GovernanceToolError(
@@ -1622,8 +3479,47 @@ class SocietyOrchestrator:
                 raise GovernanceToolError(f"Agent retry failed for {tool_name}: {retry_exc}") from retry_exc
 
         result_dict = result.model_dump()
-        self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], result_dict, "native_agno", True)
+        self._emit_tool_call(task.id, tool_name, actor_identity.id, prompt[:200], result_dict, result_mode, True)
         return result
+
+    async def _run_schema_json_retry(
+        self,
+        task: TaskRun,
+        actor_identity: SocietyAgent,
+        tool_name: str,
+        schema_class: Type[T],
+        prompt: str,
+    ) -> T:
+        """Recover a Qwen governance decision through strict JSON, not a fake vote.
+
+        DashScope can ignore forced function calls while still returning a valid
+        JSON decision. This deliberately uses a separate no-tools request so
+        the response transport is unambiguous, then accepts only an exact
+        schema-valid object.
+        """
+
+        instructions = [
+            f"You are {actor_identity.name}, a specialist in {', '.join(actor_identity.skills)}.",
+            _json_only_retry_instruction(tool_name, schema_class),
+        ]
+        agent = Agent(
+            name=actor_identity.name,
+            role=actor_identity.role,
+            model=build_model(self.settings),
+            output_schema=schema_class,
+            structured_outputs=True,
+            instructions=instructions,
+            markdown=False,
+            session_id=f"{task.id}:json-retry:{actor_identity.id}:{tool_name}",
+        )
+        response = await self._call_provider(
+            lambda: agent.arun(prompt),
+            task_id=task.id,
+            actor=actor_identity.id,
+            operation=f"{tool_name}_schema_recovery",
+        )
+        self._capture_model_usage(task.id, response, "schema_json_retry", actor_identity.id)
+        return _extract_tool_result(response, tool_name, schema_class)
 
     async def _run_governance_tool_isolated(
         self,
@@ -1662,42 +3558,37 @@ class SocietyOrchestrator:
         )
 
         try:
-            response = await asyncio.wait_for(
-                agno_agent.arun(prompt),
-                timeout=self.settings.llm_timeout_seconds,
+            response = await self._call_provider(
+                lambda: agno_agent.arun(prompt),
+                task_id=task.id,
+                actor=actor_identity.id,
+                operation=f"{tool_name}_isolated",
             )
         except asyncio.TimeoutError as exc:
-            if schema_class is ReadinessBallot:
-                return _fallback_readiness_ballot(actor_identity, str(exc))
-            if schema_class is VoteDecision:
-                raise GovernanceToolError(f"Timeout calling {tool_name}: {exc}") from exc
             raise GovernanceToolError(f"Timeout calling {tool_name}: {exc}") from exc
         except Exception as exc:
             raise GovernanceToolError(f"Agent run failed for {tool_name}: {exc}") from exc
 
+        self._capture_model_usage(task.id, response, "governance_tool_isolated", actor_identity.id)
         try:
             result = _extract_tool_result(response, tool_name, schema_class)
         except ValueError as exc:
-            retry_prompt = (
-                f"{prompt}\n\n"
-                f"Your previous response did not call the required `{tool_name}` tool. "
-                f"Retry now and call `{tool_name}` exactly once. "
-                "Do not explain, summarize, or answer in prose outside the tool call."
-            )
+            retry_prompt = f"{prompt}\n\n{_json_only_retry_instruction(tool_name, schema_class)}"
             try:
-                retry_response = await asyncio.wait_for(
-                    agno_agent.arun(retry_prompt),
-                    timeout=self.settings.llm_timeout_seconds,
+                retry_response = await self._call_provider(
+                    lambda: agno_agent.arun(retry_prompt),
+                    task_id=task.id,
+                    actor=actor_identity.id,
+                    operation=f"{tool_name}_isolated_retry",
                 )
+                self._capture_model_usage(task.id, retry_response, "governance_tool_isolated_retry", actor_identity.id)
                 result = _extract_tool_result(retry_response, tool_name, schema_class)
             except (asyncio.TimeoutError, ValueError) as retry_exc:
-                if schema_class is ReadinessBallot:
-                    return _fallback_readiness_ballot(actor_identity, str(retry_exc))
                 raise GovernanceToolError(
                     f"Could not extract valid tool result for {tool_name} after retry: {retry_exc}"
                 ) from retry_exc
             except Exception as retry_exc:
-                raise GovernanceToolError(f"Agent retry failed for {tool_name}: {retry_exc}") from retry_exc
+                raise GovernanceToolError(f"Agent retry failed for {tool_name}: {retry_exc}") from exc
 
         return result
 
@@ -2100,7 +3991,7 @@ class SocietyOrchestrator:
             brief = state.get("working_brief")
             brief_summary = brief.get("summary", "") if isinstance(brief, dict) else ""
             self._emit(task.id, "leader_election_started", "Leader election started after readiness.", payload={"working_brief_summary": brief_summary})
-        if not self.settings.llm_enabled:
+        if self.settings.efficient_society_enabled or not self.settings.llm_enabled:
             task_class = str(state.get("task_class") or "planning")
             leader_id = max(team.member_ids, key=lambda aid: self._leadership_score(aid, task_class) + len(self.agents[aid].skills) * 0.05)
             team.leader_id = leader_id
@@ -2109,9 +4000,9 @@ class SocietyOrchestrator:
             state["leader_id"] = leader_id
             state["reputations"] = self._reputation_snapshot(team.member_ids)
             state["metrics"]["governance_rounds"] += 1
-            reason = f"deterministic contextual trust score for {task_class}"
+            reason = f"computed contextual capability score for {task_class}"
             self._emit(task.id, "leader_elected", f"{self.agents[leader_id].name} was elected task leader.", actor=leader_id, payload={"reason": reason, "task_class": task_class, "leadership_score": self._leadership_score(leader_id, task_class)})
-            self._emit_tool_call(task.id, "elect_leader", leader_id, "deterministic", {"leader_id": leader_id, "reason": reason, "confidence": 1.0}, "deterministic_no_key", True)
+            self._emit_tool_call(task.id, "elect_leader", leader_id, "computed", {"leader_id": leader_id, "reason": reason, "confidence": 1.0}, "deterministic_no_key", True)
             self._record_leader_endorsements(task.id, team, leader_id, "deterministic election score")
             return
 
@@ -2193,6 +4084,20 @@ class SocietyOrchestrator:
         self._do_spawn(task, team, leader, decision.reason, decision.specialist_role or "Task Specialist")
 
     def _do_spawn(self, task: TaskRun, team: Team, leader: SocietyAgent, reason: str, specialist_role: str) -> None:
+        normalized_role = specialist_role.strip().casefold()
+        if any(
+            str(item.get("role", "")).strip().casefold() == normalized_role
+            for item in self._state(task.id).get("child_agents", [])
+            if isinstance(item, dict)
+        ):
+            self._emit(
+                task.id,
+                "specialist_spawn_skipped",
+                "A duplicate specialist role was not spawned.",
+                actor=leader.id,
+                payload={"specialist_role": specialist_role, "reason": "duplicate_role"},
+            )
+            return
         child_id = f"child-{uuid4().hex[:8]}"
         role_words = [part.capitalize() for part in specialist_role.replace("-", " ").split()[:2]]
         child_name = "".join(word[0] for word in role_words) or "SP"
@@ -2209,9 +4114,17 @@ class SocietyOrchestrator:
         team.member_ids.append(child.id)
         state = self._state(task.id)
         child_record = child.model_dump()
-        state["child_agents"].append(child_record)
+        registration = get_role_capabilities(resolve_role_key(child))
+        child_record["capability_registration"] = registration.model_dump() if registration else None
+        child_record["selection_reason"] = reason
+        state.setdefault("child_agents", []).append(child_record)
         state["spawn_decision"] = {"spawn": True, "reason": reason, "child_id": child.id, "specialist_role": specialist_role}
-        self._emit(task.id, "child_agent_spawned", "The leader spawned a specialist child agent.", actor=leader.id, payload={"child": child.model_dump(), "reason": reason})
+        self._emit(task.id, "child_agent_spawned", "The leader spawned a specialist child agent.", actor=leader.id, payload={
+            "child": child_record,
+            "reason": reason,
+            "can_vote": bool(registration and registration.can_vote),
+            "capabilities": registration.capabilities if registration else child.skills,
+        })
 
     async def _delegate_subtasks(self, task: TaskRun, team: Team) -> None:
         """Assign and report planned subtasks behind the delegation feature flag.
@@ -2298,33 +4211,75 @@ class SocietyOrchestrator:
             ]
         if not planned:
             return
-        research_markers = ("agno", "mcp", "context7", "sdk", "library", "framework")
-        needs_research_evidence = any(marker in task.prompt.lower() for marker in research_markers)
-        has_researcher_subtask = any(
-            subtask.get("agent_id") == "researcher"
-            and subtask.get("status") == "planned"
-            for subtask in planned
+        # Benchmark suites measure analytical coordination against a shared
+        # answer contract. Product-delivery keywords inside those fixtures must
+        # not trigger the unrelated collaborative-notes execution gate.
+        requires_implementation = (
+            not self.settings.benchmark_suite_tools_enabled
+            and _prompt_requires_implementation(task.prompt)
         )
-        if needs_research_evidence and "researcher" in team.member_ids and not has_researcher_subtask:
-            researcher_subtask = {
+        has_builder_subtask = any(
+            subtask.get("agent_id") == "builder"
+            and subtask.get("status") in {"planned", "assigned"}
+            for subtask in subtasks
+        )
+        if requires_implementation and "builder" in team.member_ids and not has_builder_subtask:
+            builder_subtask = {
                 "id": f"subtask-{uuid4().hex[:10]}",
-                "agent_id": "researcher",
+                "agent_id": "builder",
                 "subtask": (
-                    "Collect Context7-backed evidence for the technical documentation claims, "
-                    "identify the exact Agno API pattern, and list unsupported assumptions before implementation work proceeds."
+                    "Produce the concrete implementation deliverable for this task: "
+                    "the runnable artifact, integration steps, and acceptance checks. "
+                    "No mocks, stubs, or simulated behavior."
                 ),
                 "status": "planned",
-                "source": "required_research_evidence",
+                "done_criteria": ["Deliverable is executable or verifiable", "Acceptance checks are explicit"],
+                "why_assigned": "User brief requires implementation; builder owns delivery",
+                "blocking_if_missing": True,
+                "source": "required_brief_deliverable",
+                "provenance": "user_brief",
             }
-            subtasks.append(researcher_subtask)
-            planned.insert(0, researcher_subtask)
+            subtasks.append(builder_subtask)
+            planned.append(builder_subtask)
             self._emit(
                 task.id,
-                "research_subtask_required",
-                "A researcher evidence subtask was inserted before implementation work.",
-                actor="researcher",
-                payload=researcher_subtask,
+                "builder_subtask_required",
+                "A builder implementation subtask was inserted because the user brief requires a deliverable.",
+                actor="builder",
+                payload=builder_subtask,
             )
+        requires_validation = _prompt_requires_validation(task.prompt)
+        has_critic_subtask = any(
+            subtask.get("agent_id") == "critic"
+            and subtask.get("status") in {"planned", "assigned"}
+            for subtask in subtasks
+        )
+        if requires_validation and "critic" in team.member_ids and not has_critic_subtask:
+            critic_subtask = {
+                "id": f"subtask-{uuid4().hex[:10]}",
+                "agent_id": "critic",
+                "subtask": (
+                    "Validate the implementation deliverable: run acceptance checks, "
+                    "identify failure modes, and confirm quality gates before the final answer."
+                ),
+                "status": "planned",
+                "done_criteria": ["Acceptance checks executed", "Failure modes documented"],
+                "why_assigned": "User brief requires validation; critic owns quality gates",
+                "blocking_if_missing": True,
+                "source": "required_brief_deliverable",
+                "provenance": "user_brief",
+            }
+            subtasks.append(critic_subtask)
+            planned.append(critic_subtask)
+            self._emit(
+                task.id,
+                "critic_subtask_required",
+                "A critic validation subtask was inserted because the user brief requires validation.",
+                actor="critic",
+                payload=critic_subtask,
+            )
+        role_order = {"researcher": 0, "builder": 1, "critic": 2, "architect": 3}
+        planned.sort(key=lambda item: role_order.get(str(item.get("agent_id")), 4))
         leader_id = team.leader_id or team.member_ids[0]
         processed: list[dict[str, Any]] = []
         for index, subtask in enumerate(planned, start=1):
@@ -2334,6 +4289,11 @@ class SocietyOrchestrator:
             if agent_id not in team.member_ids:
                 continue
             agent = self.agents[agent_id]
+            role_key = resolve_role_key(agent)
+            required_capabilities = subtask.setdefault(
+                "required_capabilities",
+                default_required_capabilities(role_key),
+            )
             existing_done_criteria = subtask.get("done_criteria", [])
             existing_provenance = subtask.get("source", "") or subtask.get("provenance", "")
             existing_why = subtask.get("why_assigned", "")
@@ -2350,16 +4310,7 @@ class SocietyOrchestrator:
                 "a short why_assigned rationale, done_criteria list, blocking_if_missing flag, "
                 "and provenance origin."
             )
-            try:
-                assignment = await self._run_governance_tool(
-                    task=task,
-                    actor_identity=self.agents[leader_id],
-                    tool_func=assign_subtask_tool,
-                    tool_name="assign_subtask",
-                    schema_class=SubtaskAssignment,
-                    prompt=assignment_prompt,
-                )
-            except GovernanceToolError as exc:
+            if self.settings.efficient_society_enabled:
                 assignment = SubtaskAssignment(
                     id=str(subtask["id"]),
                     subtask_id=str(subtask["id"]),
@@ -2368,13 +4319,38 @@ class SocietyOrchestrator:
                     subtask=str(subtask.get("subtask", "")),
                     deadline_step=index,
                     assigned_by=leader_id,
-                    why_assigned=existing_why or f"Recovered from assignment tool issue: {str(exc)[:120]}",
+                    why_assigned=existing_why or "Assigned from the typed team coordination brief.",
                     done_criteria=[str(item) for item in existing_done_criteria],
                     depends_on=[],
                     blocking_if_missing=bool(existing_blocking),
                     provenance=existing_provenance or "leader_plan",
                 )
-                self._emit_tool_call(task.id, "assign_subtask", leader_id, assignment_prompt[:200], assignment.model_dump(), "native_agno", False)
+            else:
+                try:
+                    assignment = await self._run_governance_tool(
+                        task=task,
+                        actor_identity=self.agents[leader_id],
+                        tool_func=assign_subtask_tool,
+                        tool_name="assign_subtask",
+                        schema_class=SubtaskAssignment,
+                        prompt=assignment_prompt,
+                    )
+                except GovernanceToolError as exc:
+                    assignment = SubtaskAssignment(
+                        id=str(subtask["id"]),
+                        subtask_id=str(subtask["id"]),
+                        status="assigned",
+                        agent_id=agent_id,
+                        subtask=str(subtask.get("subtask", "")),
+                        deadline_step=index,
+                        assigned_by=leader_id,
+                        why_assigned=existing_why or f"Recovered from assignment tool issue: {str(exc)[:120]}",
+                        done_criteria=[str(item) for item in existing_done_criteria],
+                        depends_on=[],
+                        blocking_if_missing=bool(existing_blocking),
+                        provenance=existing_provenance or "leader_plan",
+                    )
+                    self._emit_tool_call(task.id, "assign_subtask", leader_id, assignment_prompt[:200], assignment.model_dump(), "native_agno", False)
             update_fields = assignment.model_dump()
             update_fields["id"] = update_fields.get("id") or update_fields.get("subtask_id") or subtask["id"]
             update_fields.pop("subtask_id", None)
@@ -2397,6 +4373,7 @@ class SocietyOrchestrator:
                     "why_assigned": resolved_why,
                     "done_criteria": resolved_done_criteria,
                     "blocking_if_missing": resolved_blocking,
+                    "required_capabilities": required_capabilities,
                     "provenance": resolved_provenance,
                     "status": "assigned",
                 },
@@ -2425,22 +4402,64 @@ class SocietyOrchestrator:
                 "Return the concrete work product, blockers if any, and the evidence you used. "
                 "If you have role-specific tools, use them before answering when they are relevant."
             )
-            try:
-                work_result = await self._ask_agent(agent, work_prompt, task_id=task.id)
-            except (asyncio.TimeoutError, Exception) as exc:
-                work_result = (
-                    f"Recovered fallback work product for {agent.name}: {subtask.get('subtask', '')}. "
-                    f"The agent work-product call failed with {type(exc).__name__}; continue with this subtask as partial evidence."
+            if _prompt_has_no_mock_constraint(task.prompt):
+                work_prompt += (
+                    "\n\nCONSTRAINT: The user brief explicitly forbids mocks, fabrication, "
+                    "and simulated behavior. Do not recommend or produce mock, stub, fake, "
+                    "or offline-simulated deliverables. Use only real evidence and real "
+                    "executable artifacts."
                 )
-                self._emit_tool_call(
-                    task.id,
-                    "agent_work_product",
-                    agent_id,
-                    work_prompt[:200],
-                    {"result": work_result, "recovered": True, "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
-                    "native_agno",
-                    False,
+            work_result, work_agent, work_agent_id = await self._execute_subtask_with_retry(
+                task, team, subtask, agent, agent_id, work_prompt,
+            )
+            if work_result is None:
+                processed.append(subtask)
+                continue
+
+            execution_evidence: dict[str, Any] | None = None
+            if agent_id == "builder" and _prompt_requires_collaborative_notes_demo(task.prompt):
+                evidence_items = self._state(task.id).get("execution_evidence", [])
+                execution_evidence = next(
+                    (item for item in reversed(evidence_items) if isinstance(item, dict) and item.get("passed")),
+                    None,
                 )
+                execution_evidence = execution_evidence or load_notes_demo_evidence(task.id)
+                if execution_evidence is not None and execution_evidence.get("passed"):
+                    self._state(task.id).setdefault("execution_evidence", []).append(execution_evidence)
+                    self._emit_tool_call(
+                        task.id,
+                        "execute_notes_demo",
+                        agent_id,
+                        "architecture=centralized",
+                        execution_evidence,
+                        "native_agno",
+                        True,
+                    )
+                if execution_evidence is None and requires_implementation:
+                    blocker = "Builder did not produce passed execute_notes_demo tool evidence."
+                    subtask.update({
+                        "status": "blocked",
+                        "outcome_status": "blocked",
+                        "result_summary": blocker,
+                        "outcome_summary": blocker,
+                        "blockers": [blocker],
+                        "evidence_refs": [],
+                        "provenance": "missing_builder_execution_evidence",
+                    })
+                    self._emit(
+                        task.id,
+                        "delegation_reported",
+                        f"{agent.name} did not produce executable evidence for subtask {subtask['id']}.",
+                        actor=agent_id,
+                        payload={
+                            "subtask_id": subtask["id"], "agent_id": agent_id, "status": "blocked",
+                            "result_summary": blocker, "blockers": [blocker], "outcome_status": "blocked",
+                            "outcome_summary": blocker, "evidence_refs": [],
+                            "provenance": "missing_builder_execution_evidence",
+                        },
+                    )
+                    processed.append(subtask)
+                    continue
 
             report_prompt = (
                 f"Task: {task.prompt}\n"
@@ -2451,42 +4470,75 @@ class SocietyOrchestrator:
                 "outcome_status (completed, partial, blocked, or failed), "
                 "outcome_summary (one-line outcome for cockpit), and provenance."
             )
-            try:
-                report = await self._run_governance_tool(
-                    task=task,
-                    actor_identity=agent,
-                    tool_func=report_subtask_tool,
-                    tool_name="report_subtask",
-                    schema_class=SubtaskReport,
-                    prompt=report_prompt,
-                )
-            except GovernanceToolError as exc:
+            if self.settings.efficient_society_enabled:
+                concise_result = " ".join(work_result.strip().split())[:240]
                 report = SubtaskReport(
                     id=str(subtask["id"]),
                     subtask_id=str(subtask["id"]),
                     status="completed",
                     agent_id=agent_id,
                     result=work_result,
-                    result_summary=work_result[:240],
+                    result_summary=concise_result,
                     blockers=[],
-                    evidence_refs=["fallback work product"],
-                    outcome_status="partial",
-                    outcome_summary=f"Recovered from report tool issue: {str(exc)[:160]}",
-                    provenance="agent_report_fallback",
+                    evidence_refs=[],
+                    outcome_status="completed",
+                    outcome_summary=concise_result,
+                    provenance="direct_agent_work_product",
                 )
-                self._emit_tool_call(task.id, "report_subtask", agent_id, report_prompt[:200], report.model_dump(), "native_agno", False)
+            else:
+                try:
+                    report = await self._run_governance_tool(
+                        task=task,
+                        actor_identity=agent,
+                        tool_func=report_subtask_tool,
+                        tool_name="report_subtask",
+                        schema_class=SubtaskReport,
+                        prompt=report_prompt,
+                    )
+                except GovernanceToolError as exc:
+                    report = SubtaskReport(
+                        id=str(subtask["id"]),
+                        subtask_id=str(subtask["id"]),
+                        status="blocked",
+                        agent_id=agent_id,
+                        result=work_result,
+                        result_summary=work_result[:240],
+                        blockers=[f"report_subtask failed: {str(exc)[:160]}"],
+                        evidence_refs=[],
+                        outcome_status="blocked",
+                        outcome_summary=f"The work product could not be truthfully registered: {str(exc)[:160]}",
+                        provenance="agent_report_failure",
+                    )
+                    self._emit_tool_call(task.id, "report_subtask", agent_id, report_prompt[:200], report.model_dump(), "native_agno", False)
             update_fields = report.model_dump()
+            if agent_id == "critic" and load_notes_demo_evidence(task.id):
+                identified_risks = [str(item) for item in update_fields.get("blockers", []) if str(item).strip()]
+                update_fields["identified_risks"] = identified_risks
+                update_fields["blockers"] = []
+                update_fields["status"] = "completed"
+                update_fields["outcome_status"] = "completed"
+                if identified_risks:
+                    update_fields["outcome_summary"] = (
+                        update_fields.get("outcome_summary")
+                        or f"Validation completed with {len(identified_risks)} carried risk finding(s)."
+                    )
             if update_fields.get("status") == "not_found":
                 update_fields["status"] = "blocked"
                 update_fields["blockers"] = [
                     "report_subtask did not match an assigned subtask in session state."
                 ]
             subtask.update(update_fields)
-            resolved_outcome_status = report.outcome_status or subtask.get("status", "completed")
+            resolved_outcome_status = subtask.get("outcome_status") or report.outcome_status or subtask.get("status", "completed")
             resolved_result_summary = report.result_summary or report.result[:240]
             resolved_outcome_summary = report.outcome_summary or resolved_result_summary
             resolved_provenance = report.provenance or "agent_report"
             resolved_evidence_refs = report.evidence_refs or subtask.get("evidence_refs", [])
+            if execution_evidence is not None:
+                resolved_evidence_refs = [
+                    f"execution:{execution_evidence['artifact_dir']}",
+                    *[str(path) for path in execution_evidence.get("files", [])],
+                ]
+                subtask["evidence_refs"] = resolved_evidence_refs
             self._emit(
                 task.id,
                 "delegation_reported",
@@ -2532,6 +4584,425 @@ class SocietyOrchestrator:
                     ],
                 },
             )
+
+    async def _execute_subtask_with_retry(
+        self,
+        task: TaskRun,
+        team: Team,
+        subtask: dict[str, Any],
+        agent: SocietyAgent,
+        agent_id: str,
+        work_prompt: str,
+    ) -> tuple[str | None, SocietyAgent, str]:
+        """Execute the _ask_agent work-product call with durable retry/reassignment.
+
+        Returns (work_result, effective_agent, effective_agent_id) on success,
+        or (None, agent, agent_id) when the subtask is exhausted/blocked.
+        """
+
+        state = self._state(task.id)
+        attempts_store: dict[str, Any] = state.setdefault("subtask_attempts", {})
+        idempotency_store: dict[str, str] = state.setdefault("subtask_idempotency_keys", {})
+        subtask_id = subtask["id"]
+        max_attempts = int(self.settings.subtask_max_attempts)
+        self._restore_subtask_attempt_state(task.id, subtask_id, max_attempts)
+        attempt_state: dict[str, Any] = attempts_store.setdefault(subtask_id, {
+            "attempt_count": 0,
+            "max_attempts": max_attempts,
+            "attempts": [],
+            "status": "pending",
+            "agent_id": agent_id,
+            "exhaustion_reason": None,
+        })
+        attempt_state["max_attempts"] = max_attempts
+
+        current_agent = agent
+        current_agent_id = agent_id
+        if attempt_state.get("status") in {"completed", "blocked"}:
+            return None, current_agent, current_agent_id
+
+        any_attempt_executed = False
+
+        while attempt_state["attempt_count"] < attempt_state["max_attempts"]:
+            attempt_state["attempt_count"] += 1
+            attempt_num = attempt_state["attempt_count"]
+            idem_key = make_idempotency_key(task.id, subtask_id, current_agent_id, attempt_num)
+
+            if idem_key in idempotency_store:
+                continue
+            idempotency_store[idem_key] = "in_progress"
+            any_attempt_executed = True
+
+            attempt_record = build_attempt_record(
+                subtask_id=subtask_id,
+                agent_id=current_agent_id,
+                attempt_number=attempt_num,
+                max_attempts=attempt_state["max_attempts"],
+                idempotency_key=idem_key,
+                model=self.settings.active_model,
+                provider=str(self.settings.provider),
+            )
+            attempt_state["attempts"].append(attempt_record)
+            usage_start = len(state.get("model_usage", []))
+
+            self._emit(
+                task.id,
+                "subtask_attempt_started",
+                f"Subtask {subtask_id} attempt {attempt_num} by {current_agent_id}.",
+                actor=current_agent_id,
+                payload={
+                    "subtask_id": subtask_id,
+                    "agent_id": current_agent_id,
+                    "attempt_number": attempt_num,
+                    "max_attempts": attempt_state["max_attempts"],
+                    "idempotency_key": idem_key,
+                },
+            )
+
+            try:
+                work_result = await self._ask_agent(current_agent, work_prompt, task_id=task.id)
+                attempt_record["finished_at"] = time.time()
+                attempt_record["duration_seconds"] = round(attempt_record["finished_at"] - attempt_record["started_at"], 3)
+                self._populate_attempt_usage(attempt_record, state.get("model_usage", [])[usage_start:])
+                attempt_record["category"] = None
+                attempt_record["next_action"] = "success"
+                idempotency_store[idem_key] = "completed"
+                attempt_state["status"] = "completed"
+                self._emit(
+                    task.id,
+                    "subtask_attempt_completed",
+                    f"Subtask {subtask_id} attempt {attempt_num} completed.",
+                    actor=current_agent_id,
+                    payload={
+                        "subtask_id": subtask_id,
+                        "agent_id": current_agent_id,
+                        "attempt_number": attempt_num,
+                        "max_attempts": attempt_state["max_attempts"],
+                        "idempotency_key": idem_key,
+                    },
+                )
+                return work_result, current_agent, current_agent_id
+            except (asyncio.TimeoutError, Exception) as exc:
+                attempt_record["finished_at"] = time.time()
+                attempt_record["duration_seconds"] = round(attempt_record["finished_at"] - attempt_record["started_at"], 3)
+                self._populate_attempt_usage(attempt_record, state.get("model_usage", [])[usage_start:])
+                error_text = f"{type(exc).__name__}: {str(exc)[:200]}"
+                category = classify_error(exc, work_prompt[:200])
+                attempt_record["category"] = category
+                attempt_record["error_message"] = error_text
+
+                self._emit_tool_call(
+                    task.id,
+                    "agent_work_product",
+                    current_agent_id,
+                    work_prompt[:200],
+                    {"result": None, "recovered": False, "error": error_text, "category": category},
+                    "native_agno",
+                    False,
+                )
+                self._emit(
+                    task.id,
+                    "subtask_attempt_failed",
+                    f"Subtask {subtask_id} attempt {attempt_num} failed ({category}).",
+                    actor=current_agent_id,
+                    payload={
+                        "subtask_id": subtask_id,
+                        "agent_id": current_agent_id,
+                        "attempt_number": attempt_num,
+                        "category": category,
+                        "error": error_text,
+                        "idempotency_key": idem_key,
+                    },
+                )
+
+                if category in ("user_decision", "deterministic"):
+                    attempt_record["next_action"] = "stop"
+                    attempt_record["exhaustion_reason"] = f"non_retryable:{category}"
+                    attempt_state["status"] = "blocked"
+                    attempt_state["exhaustion_reason"] = f"non_retryable:{category}"
+                    idempotency_store[idem_key] = "exhausted"
+                    self._mark_subtask_blocked(task.id, subtask, current_agent_id, error_text, category)
+                    self._emit(
+                        task.id,
+                        "subtask_exhausted",
+                        f"Subtask {subtask_id} exhausted: {category} is not retryable.",
+                        actor=current_agent_id,
+                        payload={
+                            "subtask_id": subtask_id,
+                            "agent_id": current_agent_id,
+                            "category": category,
+                            "exhaustion_reason": f"non_retryable:{category}",
+                            "attempts": attempt_state["attempt_count"],
+                        },
+                    )
+                    return None, current_agent, current_agent_id
+
+                if category == "capability":
+                    reassigned = self._try_reassign_subtask(task, team, subtask, current_agent_id)
+                    if reassigned is not None:
+                        new_agent_id, new_agent = reassigned
+                        attempt_record["next_action"] = "reassigned"
+                        idempotency_store[idem_key] = "reassigned"
+                        self._emit(
+                            task.id,
+                            "subtask_reassigned",
+                            f"Subtask {subtask_id} reassigned from {current_agent_id} to {new_agent_id}.",
+                            actor=current_agent_id,
+                            payload={
+                                "subtask_id": subtask_id,
+                                "from_agent_id": current_agent_id,
+                                "to_agent_id": new_agent_id,
+                                "reason": f"capability_failure:{error_text[:120]}",
+                            },
+                        )
+                        attempt_state["agent_id"] = new_agent_id
+                        current_agent = new_agent
+                        current_agent_id = new_agent_id
+                        subtask["agent_id"] = new_agent_id
+                        continue
+                    else:
+                        attempt_record["next_action"] = "stop"
+                        attempt_record["exhaustion_reason"] = "capability:no_alternative"
+                        attempt_state["status"] = "blocked"
+                        attempt_state["exhaustion_reason"] = "capability:no_alternative"
+                        idempotency_store[idem_key] = "exhausted"
+                        self._mark_subtask_blocked(task.id, subtask, current_agent_id, error_text, category)
+                        self._emit(
+                            task.id,
+                            "subtask_exhausted",
+                            f"Subtask {subtask_id} exhausted: no capable alternative for capability failure.",
+                            actor=current_agent_id,
+                            payload={
+                                "subtask_id": subtask_id,
+                                "agent_id": current_agent_id,
+                                "category": category,
+                                "exhaustion_reason": "capability:no_alternative",
+                                "attempts": attempt_state["attempt_count"],
+                            },
+                        )
+                        return None, current_agent, current_agent_id
+
+                if is_retryable(category) and attempt_state["attempt_count"] < attempt_state["max_attempts"]:
+                    delay = compute_backoff(
+                        attempt_num,
+                        base=self.settings.subtask_backoff_base_seconds,
+                        cap=self.settings.subtask_backoff_cap_seconds,
+                    )
+                    attempt_record["next_action"] = "retry"
+                    idempotency_store[idem_key] = "retry_scheduled"
+                    self._emit(
+                        task.id,
+                        "subtask_retry_scheduled",
+                        f"Subtask {subtask_id} retry scheduled in {delay}s (attempt {attempt_num + 1}/{attempt_state['max_attempts']}).",
+                        actor=current_agent_id,
+                        payload={
+                            "subtask_id": subtask_id,
+                            "agent_id": current_agent_id,
+                            "next_attempt": attempt_num + 1,
+                            "max_attempts": attempt_state["max_attempts"],
+                            "backoff_seconds": delay,
+                            "category": category,
+                        },
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                attempt_record["next_action"] = "stop"
+                attempt_record["exhaustion_reason"] = f"budget_exhausted:{category}"
+                attempt_state["status"] = "blocked"
+                attempt_state["exhaustion_reason"] = f"budget_exhausted:{category}"
+                idempotency_store[idem_key] = "exhausted"
+                self._mark_subtask_blocked(task.id, subtask, current_agent_id, error_text, category)
+                self._emit(
+                    task.id,
+                    "subtask_exhausted",
+                    f"Subtask {subtask_id} exhausted after {attempt_state['attempt_count']} attempts.",
+                    actor=current_agent_id,
+                    payload={
+                        "subtask_id": subtask_id,
+                        "agent_id": current_agent_id,
+                        "category": category,
+                        "exhaustion_reason": f"budget_exhausted:{category}",
+                        "attempts": attempt_state["attempt_count"],
+                    },
+                )
+                return None, current_agent, current_agent_id
+
+        if not any_attempt_executed:
+            return None, current_agent, current_agent_id
+
+        attempt_state["status"] = "blocked"
+        attempt_state["exhaustion_reason"] = "budget_exhausted:max_attempts_reached"
+        self._mark_subtask_blocked(task.id, subtask, current_agent_id, "max_attempts_reached", "transient")
+        self._emit(
+            task.id,
+            "subtask_exhausted",
+            f"Subtask {subtask_id} exhausted: max attempts reached.",
+            actor=current_agent_id,
+            payload={
+                "subtask_id": subtask_id,
+                "agent_id": current_agent_id,
+                "exhaustion_reason": "budget_exhausted:max_attempts_reached",
+                "attempts": attempt_state["attempt_count"],
+            },
+        )
+        return None, current_agent, current_agent_id
+
+    def _restore_subtask_attempt_state(
+        self,
+        task_id: str,
+        subtask_id: str,
+        max_attempts: int,
+    ) -> None:
+        """Rebuild attempt budgets from durable events after process restart.
+
+        A started attempt without a terminal event is treated as interrupted and
+        consumes its attempt number. This favors at-most-once execution over
+        silently repeating potentially side-effecting work.
+        """
+
+        state = self._state(task_id)
+        attempts_store = state.setdefault("subtask_attempts", {})
+        if subtask_id in attempts_store:
+            return
+        idempotency_store = state.setdefault("subtask_idempotency_keys", {})
+        try:
+            events = self.events.list(task_id)
+        except Exception:
+            return
+        task_events = [
+            event for event in events
+            if str(event.payload.get("subtask_id", "")) == subtask_id
+        ]
+        relevant = [event for event in task_events if event.type.startswith("subtask_attempt_")]
+        exhausted_event = next(
+            (event for event in reversed(task_events) if event.type == "subtask_exhausted"),
+            None,
+        )
+        if not relevant and exhausted_event is None:
+            return
+        records: dict[int, dict[str, Any]] = {}
+        status = "pending"
+        agent_id = ""
+        for event in relevant:
+            payload = event.payload
+            number = int(payload.get("attempt_number", 0) or 0)
+            if number <= 0:
+                continue
+            agent_id = str(payload.get("agent_id") or event.actor or agent_id)
+            key = str(payload.get("idempotency_key", ""))
+            record = records.setdefault(number, {
+                "subtask_id": subtask_id,
+                "agent_id": agent_id,
+                "attempt_number": number,
+                "max_attempts": int(payload.get("max_attempts", max_attempts)),
+                "idempotency_key": key,
+                "started_at": 0.0,
+                "finished_at": None,
+                "next_action": "interrupted_after_restart",
+            })
+            if event.type == "subtask_attempt_started":
+                idempotency_store[key] = "interrupted"
+                status = "blocked"
+            elif event.type == "subtask_attempt_failed":
+                record["category"] = payload.get("category")
+                record["error_message"] = payload.get("error")
+                record["next_action"] = "retry"
+                idempotency_store[key] = "retry_scheduled"
+                status = "pending"
+            elif event.type == "subtask_attempt_completed":
+                record["next_action"] = "success"
+                idempotency_store[key] = "completed"
+                status = "completed"
+        exhaustion_reason = None
+        if exhausted_event is not None:
+            status = "blocked"
+            exhaustion_reason = str(
+                exhausted_event.payload.get("exhaustion_reason", "attempt_budget_exhausted")
+            )
+        elif status == "blocked":
+            exhaustion_reason = "interrupted_requires_reconciliation"
+        attempts_store[subtask_id] = {
+            "attempt_count": max(records, default=0),
+            "max_attempts": max_attempts,
+            "attempts": [records[number] for number in sorted(records)],
+            "status": status,
+            "agent_id": agent_id,
+            "exhaustion_reason": exhaustion_reason,
+            "restored_from_events": True,
+        }
+
+    @staticmethod
+    def _populate_attempt_usage(attempt_record: dict[str, Any], records: list[dict[str, Any]]) -> None:
+        """Attach usage from model calls made during one subtask attempt."""
+
+        for field in ("input_tokens", "output_tokens", "total_tokens"):
+            attempt_record[field] = sum(
+                int(record.get(field) or 0)
+                for record in records
+                if isinstance(record, dict)
+            )
+
+    def _mark_subtask_blocked(
+        self,
+        task_id: str,
+        subtask: dict[str, Any],
+        agent_id: str,
+        error_text: str,
+        category: str,
+    ) -> None:
+        subtask.update({
+            "status": "blocked",
+            "outcome_status": "blocked",
+            "result_summary": f"Agent work-product call failed after retries ({category}).",
+            "outcome_summary": error_text,
+            "blockers": [error_text],
+            "evidence_refs": [],
+            "provenance": f"agent_work_product_failure:{category}",
+        })
+        self._emit(
+            task_id,
+            "delegation_reported",
+            f"Subtask {subtask.get('id', '?')} blocked after {category} failure.",
+            actor=agent_id,
+            payload={
+                "subtask_id": subtask.get("id", ""),
+                "agent_id": agent_id,
+                "status": "blocked",
+                "result_summary": subtask["result_summary"],
+                "blockers": subtask["blockers"],
+                "outcome_status": "blocked",
+                "outcome_summary": error_text,
+                "evidence_refs": [],
+                "provenance": subtask["provenance"],
+                "error_category": category,
+            },
+        )
+
+    def _try_reassign_subtask(
+        self,
+        task: TaskRun,
+        team: Team,
+        subtask: dict[str, Any],
+        failed_agent_id: str,
+    ) -> tuple[str, SocietyAgent] | None:
+        attempts = self._state(task.id).get("subtask_attempts", {}).get(subtask["id"], {}).get("attempts", [])
+        used_ids = {
+            str(attempt.get("agent_id"))
+            for attempt in attempts
+            if isinstance(attempt, dict) and attempt.get("agent_id")
+        }
+        used_ids.add(failed_agent_id)
+        required = [str(item) for item in subtask.get("required_capabilities", [])]
+        candidate_id = find_capable_team_member(
+            team.member_ids,
+            self.agents,
+            required,
+            exclude_ids=used_ids,
+        )
+        if candidate_id is None:
+            return None
+        return candidate_id, self.agents[candidate_id]
 
     def _skills_for_specialist(self, specialist_role: str) -> list[str]:
         """Derive scoped child-agent skills from the requested specialist role."""
@@ -2778,6 +5249,163 @@ class SocietyOrchestrator:
                 return "; ".join(f"{k}={v}" for k, v in list(parsed.items())[:4])[:600]
         return text[:600]
 
+    async def _negotiate_efficient(self, task: TaskRun, team: Team) -> dict[str, str]:
+        """Produce one leader synthesis and one independent counterproposal.
+
+        Completed subtask work is the evidence base. Asking only the leader and
+        critic for full candidate answers removes repetitive proposals while
+        preserving a real disagreement opportunity and member vote.
+        """
+
+        state = self._state(task.id)
+        state["phase"] = "debating"
+        state["metrics"]["debate_rounds"] += 1
+        completed_work = [
+            {
+                "agent_id": item.get("agent_id"),
+                "objective": item.get("subtask"),
+                "result": item.get("outputs") or item.get("result"),
+                "result_summary": item.get("result_summary"),
+                "evidence_refs": item.get("evidence_refs", []),
+                "expected_artifacts": item.get("expected_artifacts", []),
+                "status": item.get("outcome_status") or item.get("status"),
+            }
+            for item in state.get("subtasks", [])
+            if isinstance(item, dict) and item.get("status") in {"completed", "partial"}
+        ]
+        work_context = json.dumps(completed_work, sort_keys=True, default=str)[:16000]
+        evidence_types = {
+            "agentbay_browser_render_succeeded",
+            "agentbay_artifact_exported",
+            "local_independent_validation_reported",
+            "composition_assignment_cleanup_completed",
+        }
+        runtime_evidence = [
+            {"type": event.type, "payload": event.payload}
+            for event in self._safe_list_events(task.id)
+            if event.type in evidence_types
+        ]
+        runtime_evidence_context = json.dumps(runtime_evidence, sort_keys=True, default=str)[:16000]
+        leader_id = team.leader_id or team.member_ids[0]
+        critic_id = next(
+            (
+                agent_id
+                for agent_id in team.member_ids
+                if agent_id != leader_id and "risk analysis" in self.agents[agent_id].skills
+            ),
+            next((agent_id for agent_id in team.member_ids if agent_id != leader_id), leader_id),
+        )
+        proposal_order = [leader_id] + ([critic_id] if critic_id != leader_id else [])
+        proposals: dict[str, str] = {}
+
+        for index, agent_id in enumerate(proposal_order):
+            agent = self.agents[agent_id]
+            prior = proposals.get(leader_id, "")
+            instruction = (
+                "Synthesize the completed specialist work into one complete candidate answer. "
+                "Follow the user's requested output schema exactly and do not invent evidence."
+                if index == 0
+                else
+                "Act as an independent adversarial reviewer. Submit a corrected counterproposal, "
+                "not commentary. Preserve correct parts, repair unsupported claims, and follow "
+                "the requested output schema exactly."
+            )
+            try:
+                record = await self._run_governance_tool(
+                    task=task,
+                    actor_identity=agent,
+                    tool_func=propose_tool,
+                    tool_name="propose",
+                    schema_class=ProposalRecord,
+                    prompt=(
+                        f"Task: {task.prompt}\n"
+                        f"Your exact agent_id is {agent_id}.\n"
+                        f"Completed specialist work: {work_context}\n"
+                        f"Authoritative runtime evidence: {runtime_evidence_context}\n"
+                        "A durable host artifact reference is the exported copy of its workspace artifact, "
+                        "not evidence of a workspace-path mismatch. Treat successful render, validation, "
+                        "and cleanup events as authoritative.\n"
+                        f"Leader proposal to review: {prior or 'none'}\n"
+                        f"{instruction}\n"
+                        "Call propose with your exact agent_id, complete proposal, and concise rationale."
+                    ),
+                )
+            except GovernanceToolError:
+                if index == 0:
+                    raise
+                self._emit(
+                    task.id,
+                    "agent_contribution_unavailable",
+                    f"{agent.name}'s counterproposal was unavailable.",
+                    actor=agent_id,
+                    payload={"phase": "lean_counterproposal"},
+                )
+                continue
+
+            proposal_id = record.proposal_id or f"prop-{uuid4().hex[:10]}"
+            proposals[agent_id] = record.proposal
+            state.setdefault("proposal_id_map", {})[agent_id] = proposal_id
+            state["proposals"][agent_id] = {
+                "proposal_id": proposal_id,
+                "proposal": record.proposal,
+                "rationale": record.rationale,
+                "round": state["metrics"]["debate_rounds"],
+            }
+            self._register_artifact(
+                task.id,
+                "proposal",
+                agent_id,
+                "debating",
+                state["proposals"][agent_id],
+                confidence=0.85,
+                status="draft",
+            )
+            self._emit(
+                task.id,
+                "agent_proposal_submitted",
+                f"{agent.name} submitted {'the synthesis' if index == 0 else 'a counterproposal'}.",
+                actor=agent_id,
+                payload={
+                    "proposal_id": proposal_id,
+                    "agent_id": agent_id,
+                    "proposal": record.proposal,
+                    "rationale": record.rationale,
+                    "round": state["metrics"]["debate_rounds"],
+                    "status": "recorded",
+                    "created_from_phase": "lean_debating",
+                },
+            )
+            self._emit(task.id, "agent_negotiated", record.proposal, actor=agent_id)
+            if index == 1:
+                state["critique_source"] = "lean_counterproposal"
+                state["critique"] = {
+                    "reviewed": leader_id,
+                    "critique": record.rationale,
+                    "risks": [],
+                    "improvements": ["Use the corrected counterproposal if it wins the vote."],
+                    "confidence": 0.8,
+                }
+                self._emit(
+                    task.id,
+                    "peer_monitor_report",
+                    f"{agent.name} reviewed the leader proposal through a counterproposal.",
+                    actor=agent_id,
+                    payload=state["critique"],
+                )
+
+        self._emit(
+            task.id,
+            "debate_round_completed",
+            "The leader synthesis and bounded counterproposal round completed.",
+            payload={
+                "round": state["metrics"]["debate_rounds"],
+                "proposal_count": len(proposals),
+                "mode": "efficient_counterproposal",
+            },
+        )
+        self._emit(task.id, "negotiation_closed", "The bounded proposal review closed.")
+        return proposals
+
     async def _negotiate(self, task: TaskRun, team: Team) -> dict[str, str]:
         proposals: dict[str, str] = {}
         state = self._state(task.id)
@@ -3017,6 +5645,8 @@ class SocietyOrchestrator:
             confidence=1.0,
             status="draft",
         )
+        changes = revision.get("changes") or []
+        change_summary = "; ".join(str(item) for item in changes[:2]) if isinstance(changes, list) else str(changes)
         self._record_shared_artifact_revision(
             task.id,
             proposal_artifact,
@@ -3027,8 +5657,6 @@ class SocietyOrchestrator:
             challenge["objection"],
         )
         self._emit(task.id, "proposal_revised", f"{target.name} revised a proposal before voting.", actor=target_id, payload=revision)
-        changes = revision.get("changes") or []
-        change_summary = "; ".join(str(item) for item in changes[:2]) if isinstance(changes, list) else str(changes)
         self._record_mind_change(
             task.id,
             MindChangeRecord(
@@ -3043,40 +5671,71 @@ class SocietyOrchestrator:
             ),
         )
 
+    async def _call_provider(
+        self,
+        call: Callable[[], Awaitable[Any]],
+        *,
+        task_id: str | None,
+        actor: str,
+        operation: str,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        """Run an Agno model call through the provider-neutral retry policy."""
+
+        def record_retry(payload: dict[str, Any]) -> None:
+            if task_id is None:
+                return
+            self._emit(
+                task_id,
+                "provider_retry_scheduled",
+                f"Transient provider failure; retrying {operation}.",
+                actor=actor,
+                payload={"operation": operation, **payload},
+            )
+
+        return await run_provider_call(
+            call,
+            timeout_seconds=timeout_seconds or self.settings.llm_timeout_seconds,
+            max_attempts=self.settings.provider_max_attempts,
+            backoff_base_seconds=self.settings.provider_backoff_base_seconds,
+            backoff_cap_seconds=self.settings.provider_backoff_cap_seconds,
+            on_retry=record_retry,
+        )
+
     async def _ask_agent(self, identity: SocietyAgent, prompt: str, context: str = "", task_id: str | None = None) -> str:
         if not self.settings.llm_enabled:
             return fallback_contribution(identity, prompt)
-        evidence_context = ""
-        if (
-            identity.id == "researcher"
-            and task_id is not None
-            and self.settings.context7_mcp_enabled
-            and any(marker in f"{prompt}\n{context}".lower() for marker in ("agno", "mcp", "context7", "sdk", "library", "framework"))
-        ):
-            try:
-                evidence = await collect_context7_evidence(
-                    self.settings,
-                    f"{prompt}\n\n{context}"[:4000],
-                )
-            except Exception as exc:
-                evidence = {
-                    "success": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "tool_calls": [],
-                }
-            self._state(task_id).setdefault("research_evidence", []).append(evidence)
+        full_prompt = f"{prompt}\n\n{context}" if context else prompt
+
+        def record_tool_intent(intent: dict[str, Any]) -> None:
+            if task_id is None:
+                return
+            self._state(task_id).setdefault("tool_intents", []).append(intent)
+            self._emit(
+                task_id,
+                "tool_intent_selected",
+                "Researcher selected an evidence tool.",
+                actor=identity.id,
+                payload=intent,
+            )
+
+        def record_tool_result(result: dict[str, Any]) -> None:
+            if task_id is None:
+                return
             self._emit(
                 task_id,
                 "research_evidence_collected",
-                "Researcher collected Context7 evidence before answering.",
+                "Researcher evaluated Context7 evidence.",
                 actor=identity.id,
-                payload=evidence,
+                payload=result,
             )
-            evidence_context = format_context7_evidence(evidence)
-        full_prompt = f"{prompt}\n\n{context}" if context else prompt
-        if evidence_context:
-            full_prompt = f"{full_prompt}\n\n{evidence_context}\n\nUse only this evidence for documentation-specific claims. Label anything else as inference."
-        async with role_tool_context(identity, self.settings) as role_tools:
+
+        async with role_tool_context(
+            identity,
+            self.settings,
+            on_tool_intent=record_tool_intent,
+            on_tool_result=record_tool_result,
+        ) as role_tools:
             agno_agent = build_agno_agent(
                 identity,
                 self.settings,
@@ -3085,67 +5744,148 @@ class SocietyOrchestrator:
                 session_id=task_id,
                 session_state=self._state(task_id) if task_id is not None else None,
             )
-            response = await asyncio.wait_for(
-                agno_agent.arun(full_prompt),
-                timeout=self.settings.llm_timeout_seconds,
+            response = await self._call_provider(
+                lambda: agno_agent.arun(full_prompt),
+                task_id=task_id,
+                actor=identity.id,
+                operation="agent_work",
             )
+            if task_id is not None:
+                self._capture_model_usage(task_id, response, "agent_work", identity.id)
+                if self.settings.benchmark_suite_tools_enabled:
+                    benchmark_tool_names = {"lookup_record", "lookup_dataset", "calculate"}
+                    if self.settings.benchmark_suite_version == "v3":
+                        from benchmarks.tools_v3 import TOOL_NAMES as V3_TOOL_NAMES
+                        benchmark_tool_names = set(V3_TOOL_NAMES)
+                    for call in getattr(response, "tools", None) or []:
+                        name = getattr(call, "tool_name", None) or getattr(call, "name", None)
+                        arguments = getattr(call, "tool_args", None) or getattr(call, "arguments", None) or {}
+                        if isinstance(call, dict):
+                            name = call.get("tool_name") or call.get("name") or name
+                            arguments = call.get("tool_args") or call.get("arguments") or arguments
+                        if name in benchmark_tool_names:
+                            self._emit(
+                                task_id,
+                                "benchmark_tool_used",
+                                f"{identity.name} used {name}.",
+                                actor=identity.id,
+                                payload={
+                                    "name": name,
+                                    "arguments": arguments if isinstance(arguments, dict) else {},
+                                },
+                            )
         return str(getattr(response, "content", response))
 
     async def _collect_proposal_opinions(self, task: TaskRun, team: Team, proposals: dict[str, str]) -> None:
         """Collect public opinions about each proposal before voting.
 
         Emits proposal_opinion_recorded events with proposal_id, agent_id,
-        stance, opinion, confidence, and phase. If no meaningful opinion is
-        available, uses an explicit neutral stance rather than fabricating.
+        stance, opinion, confidence, and phase. Model calls are isolated and
+        bounded in parallel; their events are recorded in stable roster order.
         """
 
         state = self._state(task.id)
         proposal_id_map = state.get("proposal_id_map", {})
+        if self.settings.llm_enabled and self.settings.native_debate_enabled:
+            limit = max(1, int(self.settings.readiness_concurrency))
+            semaphore = asyncio.Semaphore(limit)
+            if self.settings.efficient_society_enabled:
+                # One independent cross-review per member preserves dissent and
+                # proposal coverage without the previous O(members*proposals)
+                # all-pairs call matrix.
+                jobs = []
+                proposal_ids = list(proposals)
+                for index, agent_id in enumerate(team.member_ids):
+                    candidates = [proposer_id for proposer_id in proposal_ids if proposer_id != agent_id]
+                    if not candidates:
+                        continue
+                    proposer_id = candidates[index % len(candidates)]
+                    jobs.append((
+                        agent_id,
+                        proposer_id,
+                        proposals[proposer_id],
+                        proposal_id_map.get(proposer_id) or f"prop-{proposer_id}",
+                    ))
+            else:
+                jobs = [
+                    (agent_id, proposer_id, proposal_text, proposal_id_map.get(proposer_id) or f"prop-{proposer_id}")
+                    for agent_id in team.member_ids
+                    for proposer_id, proposal_text in proposals.items()
+                    if proposer_id != agent_id
+                ]
+
+            async def _collect_one(
+                agent_id: str,
+                proposer_id: str,
+                proposal_text: str,
+                proposal_id: str,
+            ) -> tuple[str, str, str, ProposalOpinionRecord]:
+                agent = self.agents[agent_id]
+                prompt = (
+                    f"Task: {task.prompt}\n"
+                    f"Your exact agent_id is {agent_id}.\n"
+                    f"Proposal from {proposer_id} (id: {proposal_id}):\n{proposal_text}\n"
+                    "State your honest opinion of this proposal. "
+                    "Use stance: support, oppose, uncertain, or neutral. "
+                    "If you have no meaningful view, use neutral. "
+                    "Call record_proposal_opinion with your exact agent_id and the proposal_id."
+                )
+                async with semaphore:
+                    opinion = await self._run_governance_tool_isolated(
+                        task=task,
+                        actor_identity=agent,
+                        tool_func=record_proposal_opinion_tool,
+                        tool_name="record_proposal_opinion",
+                        schema_class=ProposalOpinionRecord,
+                        prompt=prompt,
+                        derived_session_id=f"{task.id}:opinion:{agent_id}:{proposal_id}:{uuid4().hex[:8]}",
+                        state_snapshot=copy.deepcopy(state),
+                    )
+                return agent_id, proposer_id, proposal_id, opinion
+
+            results = await asyncio.gather(*[
+                _collect_one(agent_id, proposer_id, proposal_text, proposal_id)
+                for agent_id, proposer_id, proposal_text, proposal_id in jobs
+            ])
+            for agent_id, proposer_id, _proposal_id, opinion in results:
+                opinion_payload = opinion.model_dump()
+                state.setdefault("proposal_opinions", []).append(opinion_payload)
+                self._emit_tool_call(task.id, "record_proposal_opinion", agent_id, f"proposal={_proposal_id}", opinion_payload, "native_agno", True)
+                self._emit(
+                    task.id,
+                    "proposal_opinion_recorded",
+                    f"{self.agents[agent_id].name} recorded an opinion on {proposer_id}'s proposal.",
+                    actor=agent_id,
+                    payload=opinion_payload,
+                )
+            return
+
         for agent_id in team.member_ids:
             agent = self.agents[agent_id]
             for proposer_id, proposal_text in proposals.items():
                 if proposer_id == agent_id:
                     continue
                 proposal_id = proposal_id_map.get(proposer_id) or f"prop-{proposer_id}"
-                if self.settings.llm_enabled and self.settings.native_debate_enabled:
-                    opinion = await self._run_governance_tool(
-                        task=task,
-                        actor_identity=agent,
-                        tool_func=record_proposal_opinion_tool,
-                        tool_name="record_proposal_opinion",
-                        schema_class=ProposalOpinionRecord,
-                        prompt=(
-                            f"Task: {task.prompt}\n"
-                            f"Your exact agent_id is {agent_id}.\n"
-                            f"Proposal from {proposer_id} (id: {proposal_id}):\n{proposal_text}\n"
-                            "State your honest opinion of this proposal. "
-                            "Use stance: support, oppose, uncertain, or neutral. "
-                            "If you have no meaningful view, use neutral. "
-                            "Call record_proposal_opinion with your exact agent_id and the proposal_id."
-                        ),
-                    )
-                    opinion_payload = opinion.model_dump()
-                else:
-                    stance = self._deterministic_opinion_stance(agent, proposer_id)
-                    opinion_text = self._deterministic_opinion_text(agent, proposer_id, proposal_text)
-                    opinion_payload = {
-                        "agent_id": agent_id,
-                        "proposal_id": proposal_id,
-                        "opinion": opinion_text,
-                        "stance": stance,
-                        "confidence": 0.5,
-                        "phase": "proposal_review",
-                    }
-                    state.setdefault("proposal_opinions", []).append(opinion_payload)
-                    self._emit_tool_call(
-                        task.id,
-                        "record_proposal_opinion",
-                        agent_id,
-                        "deterministic",
-                        opinion_payload,
-                        "deterministic_no_key",
-                        True,
-                    )
+                stance = self._deterministic_opinion_stance(agent, proposer_id)
+                opinion_text = self._deterministic_opinion_text(agent, proposer_id, proposal_text)
+                opinion_payload = {
+                    "agent_id": agent_id,
+                    "proposal_id": proposal_id,
+                    "opinion": opinion_text,
+                    "stance": stance,
+                    "confidence": 0.5,
+                    "phase": "proposal_review",
+                }
+                state.setdefault("proposal_opinions", []).append(opinion_payload)
+                self._emit_tool_call(
+                    task.id,
+                    "record_proposal_opinion",
+                    agent_id,
+                    "deterministic",
+                    opinion_payload,
+                    "deterministic_no_key",
+                    True,
+                )
                 self._emit(
                     task.id,
                     "proposal_opinion_recorded",
@@ -3176,7 +5916,7 @@ class SocietyOrchestrator:
             return f"This approach needs clearer boundaries before I can endorse it: {snippet}"
         return f"I can work with this direction with caveats: {snippet}"
 
-    async def _vote(self, task: TaskRun, team: Team, proposals: dict[str, str]) -> str:
+    async def _vote(self, task: TaskRun, team: Team, proposals: dict[str, str]) -> str | None:
         votes = []
         candidates = list(proposals.keys())
 
@@ -3212,6 +5952,9 @@ class SocietyOrchestrator:
                     ),
                 )
                 if self.settings.native_voting_enabled:
+                    ballots = self._state(task.id).setdefault("ballots", [])
+                    if not any(ballot.get("voter") == voter_id for ballot in ballots):
+                        ballots.append({"voter": voter_id, "choice": choice, "reason": decision.reason, "confidence": decision.confidence})
                     self._emit_tool_call(task.id, "cast_ballot", voter_id, f"candidates={','.join(candidates)}", decision.model_dump(), "native_agno", True)
                 else:
                     ballots = self._state(task.id).setdefault("ballots", [])
@@ -3219,7 +5962,7 @@ class SocietyOrchestrator:
                         ballots.append({"voter": voter_id, "choice": choice, "reason": decision.reason, "confidence": decision.confidence})
                     self._emit_tool_call(task.id, "cast_vote", voter_id, f"candidates={','.join(candidates)}", decision.model_dump(), "native_agno", True)
         else:
-            for voter_id in team.member_ids:
+            for voter_id in self._voter_ids(team):
                 proposal_texts = "".join(proposals[c] for c in candidates)
                 seed = hash((task.prompt, voter_id, proposal_texts))
                 choice = candidates[seed % len(candidates)]
@@ -3252,21 +5995,88 @@ class SocietyOrchestrator:
 
         state = self._state(task.id)
         if self.settings.llm_enabled and self.settings.native_voting_enabled:
-            await self._run_governance_tool(
-                task=task,
-                actor_identity=self.agents[team.leader_id or team.member_ids[0]],
-                tool_func=tally_ballots_tool,
-                tool_name="tally_ballots",
-                schema_class=TallyResult,
-                prompt="Tally all ballot and determine the winner. Call the tally_ballots tool.",
-            )
-            tally = state["tally"]
-            winner = state["winner_id"]
+            tally_result = None
+            if not self.settings.efficient_society_enabled:
+                tally_result = await self._run_governance_tool(
+                    task=task,
+                    actor_identity=self.agents[team.leader_id or team.member_ids[0]],
+                    tool_func=tally_ballots_tool,
+                    tool_name="tally_ballots",
+                    schema_class=TallyResult,
+                    prompt="Tally all ballot and determine the winner. Call the tally_ballots tool.",
+                )
+            # The governance tool's state mutation is its authoritative output,
+            # including an intentionally empty tally or a tie. Reconstruct the
+            # tally from persisted ballots only when the tool returned a schema
+            # result without applying its normal state side effect.
+            tool_applied_tally = state.get("phase") == "voted" and isinstance(state.get("tally"), dict)
+            persisted_ballots = [
+                ballot for ballot in state.get("ballots", [])
+                if isinstance(ballot, dict) and ballot.get("choice") in candidates
+            ]
+            if tool_applied_tally:
+                raw_tally = state.get("tally", {})
+            elif persisted_ballots:
+                raw_tally = dict(Counter(str(ballot["choice"]) for ballot in persisted_ballots))
+                if tally_result and tally_result.tally != raw_tally:
+                    self._emit(
+                        task.id,
+                        "tally_reconciled_from_ballots",
+                        "The model tally differed from persisted ballots; persisted ballots are authoritative.",
+                        payload={"model_tally": tally_result.tally, "ballot_tally": raw_tally},
+                    )
+            else:
+                raw_tally = state.get("tally")
+                if not isinstance(raw_tally, dict) or not raw_tally:
+                    raw_tally = tally_result.tally if tally_result else {}
+            tally: dict[str, int] = {}
+            if isinstance(raw_tally, dict):
+                for _key, _value in raw_tally.items():
+                    if _key in candidates and isinstance(_value, (int, float)) and not isinstance(_value, bool):
+                        tally[_key] = int(_value)
+            state["tally"] = tally
+            if not tally:
+                state["phase"] = "voted"
+                state["winner_id"] = None
+                self._emit(task.id, "ballots_tallied", "Votes were tallied but no valid winner emerged.", payload={"tally": tally, "winner": None})
+                self._pause_for_vote_resolution(task, team, proposals, tally, candidates, reason="empty_tally")
+                return None
+            top_count = max(tally.values())
+            top_candidates = [c for c, v in tally.items() if v == top_count]
+            if len(top_candidates) > 1:
+                winner = self._benchmark_equivalent_tie_winner(team, proposals, top_candidates)
+                if winner is None:
+                    state["phase"] = "voted"
+                    state["winner_id"] = None
+                    self._emit(task.id, "ballots_tallied", "Votes were tallied but the result is a tie.", payload={"tally": tally, "winner": None, "tied_candidates": top_candidates})
+                    self._pause_for_vote_resolution(task, team, proposals, tally, candidates, reason="tie", tied_candidates=top_candidates)
+                    return None
+                self._emit(task.id, "equivalent_tie_resolved", "Equivalent benchmark proposals were resolved without changing the selected answer.", payload={"tally": tally, "winner": winner, "tied_candidates": top_candidates})
+            else:
+                winner = top_candidates[0]
+            state["winner_id"] = winner
+            state["phase"] = "voted"
         else:
             tally = dict(Counter(votes).most_common())
-            winner = next(iter(tally))
             state["phase"] = "voted"
             state["tally"] = tally
+            if not tally:
+                state["winner_id"] = None
+                self._emit(task.id, "ballots_tallied", "Votes were tallied but no valid winner emerged.", payload={"tally": tally, "winner": None})
+                self._pause_for_vote_resolution(task, team, proposals, tally, candidates, reason="empty_tally")
+                return None
+            top_count = max(tally.values())
+            top_candidates = [c for c, v in tally.items() if v == top_count]
+            if len(top_candidates) > 1:
+                winner = self._benchmark_equivalent_tie_winner(team, proposals, top_candidates)
+                if winner is None:
+                    state["winner_id"] = None
+                    self._emit(task.id, "ballots_tallied", "Votes were tallied but the result is a tie.", payload={"tally": tally, "winner": None, "tied_candidates": top_candidates})
+                    self._pause_for_vote_resolution(task, team, proposals, tally, candidates, reason="tie", tied_candidates=top_candidates)
+                    return None
+                self._emit(task.id, "equivalent_tie_resolved", "Equivalent benchmark proposals were resolved without changing the selected answer.", payload={"tally": tally, "winner": winner, "tied_candidates": top_candidates})
+            else:
+                winner = top_candidates[0]
             state["winner_id"] = winner
         self._emit(task.id, "ballots_tallied", "Votes were tallied in shared session state.", payload={"tally": tally, "winner": winner})
         self._emit(task.id, "solution_selected", f"{self.agents[winner].name}'s proposal won the vote.", actor=winner)
@@ -3391,6 +6201,9 @@ class SocietyOrchestrator:
                 True,
             )
         synthesis_payload["synthesis_kind"] = "leader_synthesis"
+        # The event log is the durable source, while session state lets later
+        # stages validate the same real decision without reconstructing it.
+        state["leader_synthesis"] = synthesis_payload
         self._emit(
             task.id,
             "leader_synthesis",
@@ -3424,16 +6237,219 @@ class SocietyOrchestrator:
             "synthesis_kind": "leader_synthesis",
         }
 
+    def _ensure_independent_validator(self, task: TaskRun, team: Team) -> SocietyAgent | None:
+        """Return one scoped Test/Validation Engineer that cannot vote."""
+
+        member_ids = list(getattr(team, "member_ids", []) or [])
+        agents = getattr(self, "agents", {})
+        if not member_ids or not agents:
+            # Legacy replay summaries and narrow unit harnesses may not carry
+            # an executable roster. Real task teams always do.
+            return None
+        for agent_id in member_ids:
+            if agent_id not in agents:
+                continue
+            agent = self.agents[agent_id]
+            if resolve_role_key(agent) == "test_validation_engineer":
+                return agent
+        leader_id = team.leader_id or self._voter_ids(team)[0]
+        leader = self.agents[leader_id]
+        state = self._state(task.id)
+        prior_spawn_decision = copy.deepcopy(state.get("spawn_decision"))
+        self._do_spawn(
+            task,
+            team,
+            leader,
+            "Independently verify acceptance evidence after the decision is complete.",
+            "Test Validation Engineer",
+        )
+        state["validation_spawn"] = copy.deepcopy(state.get("spawn_decision"))
+        if prior_spawn_decision is None:
+            state.pop("spawn_decision", None)
+        else:
+            state["spawn_decision"] = prior_spawn_decision
+        validator = next(
+            self.agents[agent_id]
+            for agent_id in reversed(team.member_ids)
+            if resolve_role_key(self.agents[agent_id]) == "test_validation_engineer"
+        )
+        # Dynamic specialists are evidence reporters, never governance voters.
+        team.voter_ids = [agent_id for agent_id in team.voter_ids if agent_id != validator.id]
+        return validator
+
+    async def _run_independent_validator(self, task: TaskRun, team: Team) -> None:
+        """Execute a non-voting specialist review against recorded proof."""
+
+        state = self._state(task.id)
+        evidence = state.get("acceptance_evidence")
+        if not isinstance(evidence, dict) or not evidence:
+            # There is nothing factual to validate in legacy replay records or
+            # narrow harnesses that replace acceptance evaluation.
+            return
+        composition_validation = self._fixed_composition_validation_evidence(task.id)
+        if composition_validation is not None:
+            # The fixed Test Engineer is already independent from Builder and
+            # its local report is tied to the composed artifacts. Do not spawn
+            # a second validator that can contradict this authoritative run
+            # evidence. Missing cleanup or a failed report remain explicit
+            # required acceptance failures populated below.
+            state["independent_validation"] = {
+                "passed": composition_validation["validation_passed"],
+                "validator_id": composition_validation["validator_id"],
+                "can_vote": False,
+                "source": "fixed_test_engineer_local_validation",
+                "cleanup_complete": composition_validation["cleanup_complete"],
+                "missing_cleanup_assignment_ids": composition_validation["missing_cleanup_assignment_ids"],
+            }
+            self._emit(
+                task.id,
+                "independent_validation_completed",
+                "Fixed Test Engineer validation accepted." if composition_validation["validation_passed"] else "Fixed Test Engineer validation found proof gaps.",
+                actor=composition_validation["validator_id"],
+                payload=state["independent_validation"],
+            )
+            return
+        validator = self._ensure_independent_validator(task, team)
+        if validator is None:
+            return
+        if self.settings.llm_enabled:
+            prompt = (
+                f"Task: {task.prompt}\n\nFinal deliverable:\n{task.final_answer or ''}\n\n"
+                f"Acceptance evidence:\n{json.dumps(evidence, sort_keys=True, default=str)[:12000]}\n\n"
+                "Act independently from the voting agents. Check only the supplied evidence. "
+                "Call report_independent_validation exactly once. Mark passed=false when a claim "
+                "lacks proof or contradicts the evidence."
+            )
+            try:
+                report = await self._run_governance_tool(
+                    task=task,
+                    actor_identity=validator,
+                    tool_func=report_independent_validation_tool,
+                    tool_name="report_independent_validation",
+                    schema_class=IndependentValidationReport,
+                    prompt=prompt,
+                )
+            except GovernanceToolError as exc:
+                report = IndependentValidationReport(
+                    passed=False,
+                    missing_evidence=["independent_validator_execution"],
+                    recommendation=f"Retry the independent validation step: {str(exc)[:160]}",
+                )
+        else:
+            failed = state.get("failed_checks", [])
+            report = IndependentValidationReport(
+                passed=not failed,
+                checked_evidence_ids=[str(item.get("check", "")) for item in state.get("acceptance_checks", [])],
+                missing_evidence=[str(item.get("check", "")) for item in failed],
+                recommendation="Resolve recorded acceptance gaps." if failed else "Recorded checks passed.",
+            )
+
+        payload = report.model_dump()
+        payload.update({"validator_id": validator.id, "can_vote": False})
+        state["independent_validation"] = payload
+        self._register_artifact(
+            task.id, "independent_validation", validator.id, "validation",
+            payload, confidence=0.9 if report.passed else 0.6,
+            status="final" if report.passed else "failed",
+        )
+        self._emit(
+            task.id,
+            "independent_validation_completed",
+            "Independent validation passed." if report.passed else "Independent validation found proof gaps.",
+            actor=validator.id,
+            payload=payload,
+        )
+        if not report.passed:
+            failed_checks = state.setdefault("failed_checks", [])
+            if not any(item.get("check") == "independent_validator" for item in failed_checks if isinstance(item, dict)):
+                failed_checks.append({
+                    "check": "independent_validator",
+                    "reason": "; ".join(report.missing_evidence + report.contradictions)
+                    or report.recommendation or "independent validation failed",
+                })
+            if isinstance(evidence, dict):
+                evidence["terminal_status"] = "failed"
+                required_failures = evidence.setdefault("required_failures", [])
+                if "independent_validator" not in required_failures:
+                    required_failures.append("independent_validator")
+                optional_failures = evidence.setdefault("optional_failures", [])
+            while "independent_validator" in optional_failures:
+                optional_failures.remove("independent_validator")
+
+    def _fixed_composition_validation_evidence(self, task_id: str) -> dict[str, Any] | None:
+        """Return fixed Test Engineer validation and cleanup evidence, if selected.
+
+        This bridge intentionally trusts only event-ledger records from a
+        selected immutable Test Engineer. It never upgrades a failed report or
+        infers sandbox cleanup from a completed work node.
+        """
+
+        state = self._state(task_id)
+        selection = state.get("fixed_specialist_selection")
+        assignments = selection.get("assignments") if isinstance(selection, dict) else None
+        if not isinstance(assignments, list):
+            return None
+        expected_assignment_ids = {
+            str(item.get("assignment_id"))
+            for item in assignments
+            if isinstance(item, dict) and item.get("assignment_id")
+        }
+        validator_assignment_ids = {
+            str(item.get("assignment_id"))
+            for item in assignments
+            if isinstance(item, dict) and item.get("template_id") == "test_engineer" and item.get("assignment_id")
+        }
+        if not validator_assignment_ids:
+            return None
+
+        validation_events = [
+            event for event in self._safe_list_events(task_id)
+            if event.type == "local_independent_validation_reported"
+            and isinstance(event.payload, dict)
+            and str(event.payload.get("assignment_id")) in validator_assignment_ids
+        ]
+        latest_validation = validation_events[-1] if validation_events else None
+        cleanup_events = [
+            event for event in self._safe_list_events(task_id)
+            if event.type == "composition_assignment_cleanup_completed"
+            and isinstance(event.payload, dict)
+            and str(event.payload.get("assignment_id")) in expected_assignment_ids
+        ]
+        successful_cleanup_assignment_ids = {
+            str(event.payload["assignment_id"])
+            for event in cleanup_events
+            if event.payload.get("success") is True
+            and isinstance(event.payload.get("results"), list)
+            and bool(event.payload["results"])
+            and all(
+                isinstance(result, dict) and result.get("success") is True and result.get("closed") is True
+                for result in event.payload["results"]
+            )
+        }
+        missing_cleanup = sorted(expected_assignment_ids - successful_cleanup_assignment_ids)
+        return {
+            "validation_passed": bool(latest_validation and latest_validation.payload.get("passed") is True),
+            "validation_event_ids": [event.id for event in validation_events],
+            "cleanup_event_ids": [event.id for event in cleanup_events],
+            "cleanup_complete": not missing_cleanup,
+            "missing_cleanup_assignment_ids": missing_cleanup,
+            "validator_id": latest_validation.actor if latest_validation and latest_validation.actor else "test_engineer",
+        }
+
     async def _monitor(self, task: TaskRun, team: Team, winner: str, proposals: dict[str, str]) -> None:
         critic_id = next((aid for aid in team.member_ids if "risk analysis" in self.agents[aid].skills), team.member_ids[-1])
         critic = self.agents[critic_id]
 
         if not self.settings.llm_enabled:
-            critique = {"reviewed": winner, "critique": "deterministic fallback", "risks": [], "improvements": [], "confidence": 1.0}
+            critique = {"reviewed": winner, "critique": "", "risks": [], "improvements": [], "unavailable": True}
             self._state(task.id)["critique"] = critique
-            self._register_artifact(task.id, "critique", critic_id, "monitor", critique, confidence=1.0, status="final")
-            self._emit(task.id, "peer_monitor_report", f"{critic.name} checked the winning solution for unsupported assumptions.", actor=critic_id, payload={"reviewed": winner, "critique": "deterministic fallback"})
-            self._emit_tool_call(task.id, "peer_review", critic_id, "deterministic", {"critique": "deterministic fallback", "risks": [], "improvements": [], "confidence": 1.0}, "deterministic_no_key", True)
+            self._emit(
+                task.id,
+                "agent_contribution_unavailable",
+                f"{critic.name}'s peer review was unavailable because model access is disabled.",
+                actor=critic_id,
+                payload={"phase": "monitor", "reason": "llm_disabled", "reviewed": winner},
+            )
             return
 
         prompt = (
@@ -3496,7 +6512,7 @@ class SocietyOrchestrator:
             ("validation_pass", 1.0 if not state.get("failed_checks") else 0.0, "acceptance checks all passed"),
         ]
 
-        if self.settings.llm_enabled:
+        if self.settings.llm_enabled and not self.settings.efficient_society_enabled:
             actor = self.agents[team.leader_id or team.member_ids[0]]
             for metric_name, value, context in metrics_to_record:
                 try:
@@ -3837,56 +6853,201 @@ class SocietyOrchestrator:
         )
         return answer
 
-    def _populate_acceptance_checks(self, task_id: str, team: Team) -> None:
-        """Derive acceptance_checks and failed_checks from artifact/final-deliverable state."""
+    def _populate_acceptance_checks(self, task_id: str, team: Team, prompt: str = "") -> None:
+        """Derive a generic task-derived acceptance contract and evaluate it.
+
+        Produces ``acceptance_evidence`` (the contract + evaluation) and emits
+        ``acceptance_evidence_evaluated``.  Each requirement carries a stable
+        id, a required flag, evidence types, evidence event ids, passed status,
+        and missing-evidence descriptions.  The legacy ``acceptance_checks`` /
+        ``failed_checks`` keys are still populated for backward compatibility.
+        """
 
         state = self._state(task_id)
-        checks: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
+        task_events = self._safe_list_events(task_id)
 
         proposals = state.get("proposals", {})
         revisions = state.get("revisions", {})
         critique = state.get("critique") or {}
         final_deliverable = state.get("final_deliverable")
         artifacts = state.get("artifacts", [])
+        subtasks = state.get("subtasks", [])
+
+        evidence_event_ids_by_type: dict[str, list[str]] = {}
+        for ev in task_events:
+            evidence_event_ids_by_type.setdefault(ev.type, []).append(ev.id)
+
+        def _eids(*types: str) -> list[str]:
+            out: list[str] = []
+            for t in types:
+                out.extend(evidence_event_ids_by_type.get(t, []))
+            return out
+
+        requirements: list[dict[str, Any]] = []
 
         has_proposals = len(proposals) > 0
-        checks.append({"check": "proposals_exist", "passed": has_proposals, "source": "artifact_state"})
-        if not has_proposals:
-            failed.append({"check": "proposals_exist", "reason": "no proposals recorded"})
+        requirements.append({
+            "id": "proposals_exist",
+            "required": True,
+            "evidence_types": ["artifact_state"],
+            "evidence_event_ids": _eids("agent_proposal_submitted", "leader_synthesis"),
+            "passed": has_proposals,
+            "missing_evidence": [] if has_proposals else ["no proposals recorded"],
+        })
 
         has_winner = state.get("winner_id") is not None
-        checks.append({"check": "winner_selected", "passed": has_winner, "source": "vote_state"})
-        if not has_winner:
-            failed.append({"check": "winner_selected", "reason": "no winner_id in session state"})
+        requirements.append({
+            "id": "winner_selected",
+            "required": True,
+            "evidence_types": ["vote_state"],
+            "evidence_event_ids": _eids("winner_selected", "solution_selected", "ballots_tallied"),
+            "passed": has_winner,
+            "missing_evidence": [] if has_winner else ["no winner_id in session state"],
+        })
 
         has_critique = isinstance(critique, dict) and bool(critique.get("critique"))
-        checks.append({"check": "critique_exists", "passed": has_critique, "source": "monitor_state"})
-        if not has_critique:
-            failed.append({"check": "critique_exists", "reason": "no critique recorded"})
+        requirements.append({
+            "id": "critique_exists",
+            "required": False,
+            "evidence_types": ["monitor_state"],
+            "evidence_event_ids": _eids("peer_monitor_report", "artifact_section_critiqued"),
+            "passed": has_critique,
+            "missing_evidence": [] if has_critique else ["no critique recorded"],
+        })
 
         has_final = final_deliverable is not None
-        checks.append({"check": "final_deliverable_exists", "passed": has_final, "source": "compose_state"})
-        if not has_final:
-            failed.append({"check": "final_deliverable_exists", "reason": "no final deliverable"})
+        requirements.append({
+            "id": "final_deliverable_exists",
+            "required": True,
+            "evidence_types": ["compose_state"],
+            "evidence_event_ids": _eids("leader_synthesis"),
+            "passed": has_final,
+            "missing_evidence": [] if has_final else ["no final deliverable"],
+        })
 
         final_artifacts = [a for a in artifacts if a.get("type") == "final_deliverable" and a.get("status") == "final"]
         has_final_artifact = len(final_artifacts) > 0
-        checks.append({"check": "final_artifact_registered", "passed": has_final_artifact, "source": "artifact_ledger"})
-        if not has_final_artifact:
-            failed.append({"check": "final_artifact_registered", "reason": "no final artifact in ledger"})
+        requirements.append({
+            "id": "final_artifact_registered",
+            "required": True,
+            "evidence_types": ["artifact_ledger"],
+            "evidence_event_ids": _eids("artifact_registered"),
+            "passed": has_final_artifact,
+            "missing_evidence": [] if has_final_artifact else ["no final artifact in ledger"],
+        })
 
-        revision_count = len(revisions)
-        subtasks = state.get("subtasks", [])
-        blocked = [s for s in subtasks if s.get("blockers")]
-        if blocked:
-            checks.append({"check": "no_blocked_subtasks", "passed": False, "source": "delegation_state"})
-            failed.append({"check": "no_blocked_subtasks", "reason": f"{len(blocked)} subtask(s) have blockers"})
+        blocked = [s for s in subtasks if isinstance(s, dict) and s.get("blockers")]
+        required_blocked = [s for s in blocked if s.get("blocking_if_missing")]
+        no_blocked = len(blocked) == 0
+        requirements.append({
+            "id": "no_blocked_subtasks",
+            "required": bool(required_blocked),
+            "evidence_types": ["delegation_state"],
+            "evidence_event_ids": _eids("delegation_assigned", "delegation_reported"),
+            "passed": no_blocked,
+            "missing_evidence": [] if no_blocked else [
+                f"{len(blocked)} subtask(s) have blockers; "
+                f"{len(required_blocked)} are marked blocking_if_missing"
+            ],
+        })
+
+        composition_validation = self._fixed_composition_validation_evidence(task_id)
+        if composition_validation is not None:
+            validation_passed = composition_validation["validation_passed"]
+            requirements.append({
+                "id": "fixed_specialist_independent_validation",
+                "required": True,
+                "evidence_types": ["fixed_test_engineer"],
+                "evidence_event_ids": composition_validation["validation_event_ids"],
+                "passed": validation_passed,
+                "missing_evidence": [] if validation_passed else ["no passed local independent validation from the selected Test Engineer"],
+            })
+            cleanup_complete = composition_validation["cleanup_complete"]
+            requirements.append({
+                "id": "fixed_specialist_sandbox_cleanup",
+                "required": True,
+                "evidence_types": ["composition_cleanup"],
+                "evidence_event_ids": composition_validation["cleanup_event_ids"],
+                "passed": cleanup_complete,
+                "missing_evidence": [] if cleanup_complete else [
+                    f"missing cleanup evidence for assignments: {composition_validation['missing_cleanup_assignment_ids']}"
+                ],
+            })
+
+        proof = state.get("demo_proof") if isinstance(state.get("demo_proof"), dict) else {}
+        proof_verified = bool(proof.get("verified"))
+        requirements.append({
+            "id": "demo_proof_verified",
+            "required": False,
+            "evidence_types": ["demo_proof"],
+            "evidence_event_ids": _eids("demo_proof_verified"),
+            "passed": proof_verified,
+            "missing_evidence": [] if proof_verified else [", ".join(proof.get("missing_markers", [])) or "proof event missing"],
+        })
+
+        answer = str((final_deliverable or {}).get("answer", "")) if isinstance(final_deliverable, dict) else ""
+        effective_prompt = prompt or str(state.get("prompt", ""))
+        no_mock_compliant = not (_prompt_has_no_mock_constraint(effective_prompt) and _contains_mock_recommendation(answer))
+        requirements.append({
+            "id": "no_mock_constraint",
+            "required": True,
+            "evidence_types": ["final_deliverable"],
+            "evidence_event_ids": _eids("leader_synthesis"),
+            "passed": no_mock_compliant,
+            "missing_evidence": [] if no_mock_compliant else ["final answer recommends mocked or simulated behavior"],
+        })
+
+        required_reqs = [r for r in requirements if r["required"]]
+        optional_reqs = [r for r in requirements if not r["required"]]
+        required_passed = all(r["passed"] for r in required_reqs)
+        optional_failures = [r["id"] for r in optional_reqs if not r["passed"]]
+        required_failures = [r["id"] for r in required_reqs if not r["passed"]]
+
+        recoverable = False
+        if required_failures:
+            retryable_subtasks = [
+                s for s in subtasks
+                if isinstance(s, dict)
+                and s.get("status") in {"failed", "pending", "assigned"}
+                and not s.get("exhausted")
+            ]
+            recoverable = len(retryable_subtasks) > 0
+
+        if required_passed and not optional_failures:
+            terminal = "complete"
+        elif required_passed and optional_failures:
+            terminal = "complete_with_warnings"
+        elif recoverable:
+            terminal = "remediation"
         else:
-            checks.append({"check": "no_blocked_subtasks", "passed": True, "source": "delegation_state"})
+            terminal = "failed"
 
-        state["acceptance_checks"] = checks
-        state["failed_checks"] = failed
+        evaluation = {
+            "requirements": requirements,
+            "required_passed": required_passed,
+            "required_failures": required_failures,
+            "optional_failures": optional_failures,
+            "recoverable": recoverable,
+            "terminal_status": terminal,
+        }
+
+        state["acceptance_evidence"] = evaluation
+        state["acceptance_checks"] = [
+            {"check": r["id"], "passed": r["passed"], "source": r["evidence_types"][0] if r["evidence_types"] else "unknown"}
+            for r in requirements
+        ]
+        state["failed_checks"] = [
+            {"check": r["id"], "reason": r["missing_evidence"][0] if r["missing_evidence"] else "failed"}
+            for r in requirements if not r["passed"]
+        ]
+
+        self._emit(
+            task_id,
+            "acceptance_evidence_evaluated",
+            f"Acceptance evidence evaluated: {terminal}.",
+            actor=team.leader_id,
+            payload=evaluation,
+        )
 
     def _apply_validation_gate(self, task: TaskRun, team: Team) -> str:
         """Validate the final deliverable and revise it when checks fail."""
@@ -3895,11 +7056,23 @@ class SocietyOrchestrator:
         answer = task.final_answer or ""
         checks = state.get("acceptance_checks", [])
         failed = state.get("failed_checks", [])
-        passed = len(failed) == 0
+        evidence = state.get("acceptance_evidence")
+        passed = (
+            evidence.get("required_passed") is True
+            if isinstance(evidence, dict)
+            else len(failed) == 0
+        )
+        required_failures = set(evidence.get("required_failures", [])) if isinstance(evidence, dict) else set()
+        gate_failures = (
+            [item for item in failed if isinstance(item, dict) and item.get("check") in required_failures]
+            if isinstance(evidence, dict)
+            else list(failed)
+        )
         payload = {
             "passed": passed,
             "checks": checks,
-            "failed_checks": failed,
+            "failed_checks": gate_failures,
+            "optional_failures": evidence.get("optional_failures", []) if isinstance(evidence, dict) else [],
         }
         self._emit(
             task.id,
@@ -3909,6 +7082,17 @@ class SocietyOrchestrator:
             payload=payload,
         )
         if passed:
+            verified_summary = self._verified_fixed_composition_outcome(task.id)
+            if verified_summary is not None:
+                optional_failures = evidence.get("optional_failures", []) if isinstance(evidence, dict) else []
+                if optional_failures:
+                    verified_summary += f" Optional demo-proof gaps remain: {', '.join(str(item) for item in optional_failures)}."
+                state["final_answer"] = verified_summary
+                final_deliverable = state.get("final_deliverable")
+                if isinstance(final_deliverable, dict):
+                    final_deliverable["answer"] = verified_summary
+                    final_deliverable["validation_status"] = "verified_fixed_composition"
+                return verified_summary
             return answer
 
         failed_summary = "; ".join(
@@ -3939,6 +7123,144 @@ class SocietyOrchestrator:
             status="revised",
         )
         return revised
+
+    def _verified_fixed_composition_outcome(self, task_id: str) -> str | None:
+        """Render terminal truth from passed fixed-specialist runtime evidence.
+
+        A pre-execution leader synthesis is deliberation, not a terminal
+        runtime verdict. This replaces it only after the acceptance record
+        explicitly proves the immutable Test Engineer validation and every
+        selected sandbox cleanup passed.
+        """
+
+        state = self._state(task_id)
+        evidence = state.get("acceptance_evidence")
+        if not isinstance(evidence, dict) or evidence.get("required_passed") is not True:
+            return None
+        requirements = {
+            item.get("id"): item
+            for item in evidence.get("requirements", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        required_ids = {"fixed_specialist_independent_validation", "fixed_specialist_sandbox_cleanup"}
+        if not required_ids.issubset(requirements) or not all(requirements[item_id].get("passed") is True for item_id in required_ids):
+            return None
+
+        artifact_refs: list[str] = []
+        for event in self._safe_list_events(task_id):
+            if event.type != "agentbay_artifact_exported" or not isinstance(event.payload, dict):
+                continue
+            payload = event.payload
+            reference = payload.get("workspace_relative_path") or payload.get("path")
+            artifact_ref = payload.get("artifact_ref")
+            if not reference and isinstance(artifact_ref, dict):
+                reference = artifact_ref.get("storage_path") or artifact_ref.get("workspace_relative_path")
+            if isinstance(reference, str) and reference.strip() and reference.strip() not in artifact_refs:
+                artifact_refs.append(reference.strip())
+        artifact_text = ", ".join(artifact_refs[:6]) if artifact_refs else "the exported artifact references recorded by the runtime"
+        return (
+            "Verified runtime outcome: the fixed Builder/Test Engineer execution passed independent validation, "
+            f"exported {artifact_text}, and closed every selected execution environment successfully. "
+            "Pre-validation deliberation remains in the event history and is not the terminal verdict."
+        )
+
+    def _record_demo_proof(self, task: TaskRun, team: Team) -> None:
+        """Emit a factual checklist for the judge-facing Agent Society story.
+
+        This is deliberately an observation, not a completion gate: a run may
+        finish with a missing marker, and the UI must expose that gap instead
+        of fabricating a successful society narrative.
+        """
+
+        state = self._state(task.id)
+        bundles = state.get("tool_bundles")
+        role_keys = sorted({
+            str(bundle.get("role_key"))
+            for bundle in bundles.values()
+            if isinstance(bundle, dict) and bundle.get("role_key")
+        }) if isinstance(bundles, dict) else []
+        if len(role_keys) < 3:
+            completed_agents = {
+                str(subtask.get("agent_id"))
+                for subtask in state.get("subtasks", [])
+                if isinstance(subtask, dict)
+                and subtask.get("agent_id") in self.agents
+                and subtask.get("status") == "completed"
+                and subtask.get("outcome_status") == "completed"
+            }
+            role_keys = sorted({self._role_key(self.agents[agent_id]) for agent_id in completed_agents})
+
+        evidence_subtask_ids: list[str] = []
+        for subtask in state.get("subtasks", []):
+            if not isinstance(subtask, dict):
+                continue
+            refs = subtask.get("evidence_refs")
+            if not isinstance(refs, list):
+                continue
+            real_refs = [
+                str(reference).strip()
+                for reference in refs
+                # This exact sentinel is emitted only when reporting itself
+                # failed. A legitimate source may still contain the word
+                # "fallback" in its title or URL.
+                if str(reference).strip() and str(reference).strip().casefold() != "fallback work product"
+            ]
+            if real_refs and subtask.get("id"):
+                evidence_subtask_ids.append(str(subtask["id"]))
+
+        synthesis = state.get("leader_synthesis")
+        synthesis = synthesis if isinstance(synthesis, dict) else {}
+        carried_dissent = synthesis.get("carried_dissent")
+        carried_dissent = carried_dissent if isinstance(carried_dissent, list) else []
+        brief = state.get("working_brief")
+        if isinstance(brief, dict):
+            brief_dissent = brief.get("unresolved_dissent", [])
+            if isinstance(brief_dissent, list):
+                for item in brief_dissent:
+                    text = str(item).strip()
+                    if text and text not in carried_dissent:
+                        carried_dissent.append(text)
+        for event in reversed(self._safe_list_events(task.id)):
+            if event.type != "winner_selected":
+                continue
+            winner_dissent = event.payload.get("dissent_carried") if isinstance(event.payload, dict) else None
+            if isinstance(winner_dissent, list):
+                for item in winner_dissent:
+                    text = str(item).strip()
+                    if text and text not in carried_dissent:
+                        carried_dissent.append(text)
+            break
+        final_deliverable = state.get("final_deliverable")
+        final_deliverable = final_deliverable if isinstance(final_deliverable, dict) else {}
+
+        markers = {
+            "distinct_competencies": len(role_keys) >= 3,
+            "evidence_producing_delegation": bool(evidence_subtask_ids),
+            "leader_decision": bool(synthesis.get("winning_proposal_summary")),
+            # A hackathon proof run must demonstrate a real disagreement that
+            # survived into the leader decision; unanimous runs remain honest
+            # but do not satisfy this particular showcase marker.
+            "carried_dissent": bool(carried_dissent),
+            "final_artifact": bool(final_deliverable.get("selected_artifact_id")),
+        }
+        payload = {
+            "verified": all(markers.values()),
+            "markers": markers,
+            "competency_roles": role_keys,
+            "evidence_subtask_ids": evidence_subtask_ids,
+            "leader_id": team.leader_id,
+            "carried_dissent_count": len(carried_dissent),
+            "final_artifact_id": final_deliverable.get("selected_artifact_id"),
+            "missing_markers": [name for name, present in markers.items() if not present],
+        }
+        state["demo_proof"] = payload
+        self._emit(
+            task.id,
+            "demo_proof_verified",
+            "Agent Society proof chain verified." if payload["verified"] else "Agent Society proof chain has visible gaps.",
+            actor=team.leader_id,
+            payload=payload,
+        )
 
     def _record_task_metrics(self, task: TaskRun, start_time: float) -> None:
         """Compute, store, and emit V3 metrics for a completed task."""
