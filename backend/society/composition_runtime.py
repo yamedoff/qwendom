@@ -632,6 +632,12 @@ class AgnoAssignmentExecutor:
             {"agentbay_browser_render_succeeded"},
         ):
             missing.append("browser_render")
+        if (
+            "generate_images" in granted
+            and any(Path(str(path)).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"} for path in assignment.expected_artifacts)
+            and not _event_backed_media_artifact_ids(internal_trace)
+        ):
+            missing.append("generate_images")
         if assignment.agent_template_id == "test_engineer":
             if "inspect_artifact" in granted and not _has_success_evidence(internal_trace, {"local_artifact_inspected"}):
                 missing.append("inspect_artifact")
@@ -1169,6 +1175,37 @@ class AgnoAssignmentExecutor:
                 raise NodeExecutionError("capability", "agent_runtime_missing_arun", "Composition runtime agent must expose arun")
             response = await agent.arun(prompt)
             result = _normalize_agent_response(response)
+            needs_generated_image = (
+                "generate_images" in granted_tool_ids
+                and any(
+                    Path(str(path)).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+                    for path in assignment.expected_artifacts
+                )
+            )
+            if needs_generated_image and not self._verified_generated_media_artifacts(internal_tool_trace):
+                # An image specialist cannot complete from prose alone. Give the
+                # same bounded agent one explicit chance to invoke its real
+                # media tools before the mandatory-evidence gate rejects it.
+                await _emit_event(
+                    self._event_sink,
+                    "composition_media_correction_requested",
+                    {"assignment_id": assignment.id, "node_id": node.id},
+                )
+                correction_response = await agent.arun(
+                    "Your previous turn did not produce a verified image artifact. "
+                    "Call generate_images now with the assignment's visual direction, then call inspect_image "
+                    "and publish_image for the returned artifact ID. Do not return prose until those tool calls finish."
+                )
+                result = _normalize_agent_response(correction_response)
+                await _emit_event(
+                    self._event_sink,
+                    "composition_media_correction_completed",
+                    {
+                        "assignment_id": assignment.id,
+                        "node_id": node.id,
+                        "generated": bool(self._verified_generated_media_artifacts(internal_tool_trace)),
+                    },
+                )
             if (
                 assignment.template_version is not None
                 and assignment.expected_artifacts
