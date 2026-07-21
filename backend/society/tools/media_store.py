@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -20,7 +21,11 @@ import httpx
 from config import normalize_media_base_url
 
 
-DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 120.0
+DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 180.0
+DEFAULT_DOWNLOAD_MAX_ATTEMPTS = 2
+MAX_DOWNLOAD_MAX_ATTEMPTS = 3
+DEFAULT_DOWNLOAD_RETRY_DELAY_SECONDS = 1.0
+MAX_DOWNLOAD_RETRY_DELAY_SECONDS = 5.0
 DEFAULT_MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 PRIVATE_FILE_MODE = 0o600
 ARTIFACT_ID_PATTERN = re.compile(r"^artifact_[0-9a-f]{32}$")
@@ -201,6 +206,10 @@ class MediaArtifactStore:
         clock: Callable[[], datetime] | None = None,
         max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
         directory_fsync: Callable[[Path], None] | None = None,
+        download_timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+        download_max_attempts: int = DEFAULT_DOWNLOAD_MAX_ATTEMPTS,
+        download_retry_delay_seconds: float = DEFAULT_DOWNLOAD_RETRY_DELAY_SECONDS,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self._root_dir = Path(root_dir).resolve()
         self._clock = clock or _utc_now
@@ -211,6 +220,16 @@ class MediaArtifactStore:
         self._manifests_dir = self._root_dir / "manifests"
         self._jobs_dir = self._root_dir / "private_jobs"
         self._directory_fsync = directory_fsync or _fsync_parent_directory
+        self._download_timeout_seconds = float(download_timeout_seconds)
+        self._download_max_attempts = int(download_max_attempts)
+        self._download_retry_delay_seconds = float(download_retry_delay_seconds)
+        self._sleeper = sleeper or time.sleep
+        if self._download_timeout_seconds <= 0:
+            raise ValueError("download_timeout_seconds must be positive")
+        if not 1 <= self._download_max_attempts <= MAX_DOWNLOAD_MAX_ATTEMPTS:
+            raise ValueError("download_max_attempts must be between one and three")
+        if self._download_retry_delay_seconds < 0:
+            raise ValueError("download_retry_delay_seconds must not be negative")
         for directory in (self._root_dir, self._artifacts_dir, self._manifests_dir, self._jobs_dir):
             directory.mkdir(parents=True, exist_ok=True)
             _best_effort_private_permissions(directory)
@@ -313,38 +332,65 @@ class MediaArtifactStore:
     ) -> tuple[str, int, str]:
         validated_url = validate_provider_media_url(url)
         temp_path = self._contain_in(destination.parent, destination.with_suffix(destination.suffix + ".part"))
-        total_bytes = 0
-        hasher = hashlib.sha256()
-        try:
-            with client.stream("GET", validated_url, timeout=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=False) as response:
-                if 300 <= response.status_code < 400:
-                    raise ValueError("Provider result redirect is not allowed")
-                response.raise_for_status()
-                validate_provider_media_url(str(response.url))
-                content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                if not content_type.startswith(expected_prefix):
-                    raise ValueError("Provider returned an unsupported media type")
-                with open(temp_path, "wb") as handle:
-                    for chunk in response.iter_bytes():
-                        if not chunk:
-                            continue
-                        total_bytes += len(chunk)
-                        if total_bytes > self._max_download_bytes:
-                            raise ValueError("Downloaded media exceeded the configured size limit")
-                        handle.write(chunk)
-                        hasher.update(chunk)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            os.replace(temp_path, destination)
-            self._directory_fsync(destination)
-            _best_effort_private_permissions(destination)
-            return content_type, total_bytes, hasher.hexdigest()
-        except Exception:
-            with suppress(FileNotFoundError):
-                temp_path.unlink()
-            with suppress(FileNotFoundError):
-                destination.unlink()
-            raise
+        for attempt in range(1, self._download_max_attempts + 1):
+            total_bytes = 0
+            hasher = hashlib.sha256()
+            try:
+                with client.stream(
+                    "GET",
+                    validated_url,
+                    timeout=self._download_timeout_seconds,
+                    follow_redirects=False,
+                ) as response:
+                    if 300 <= response.status_code < 400:
+                        raise ValueError("Provider result redirect is not allowed")
+                    if response.status_code >= 400:
+                        retryable = response.status_code in {408, 429} or response.status_code >= 500
+                        if not retryable:
+                            raise ValueError(f"Provider media download failed with HTTP status {response.status_code}")
+                        raise httpx.RequestError("Transient provider media response", request=response.request)
+                    validate_provider_media_url(str(response.url))
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    if not content_type.startswith(expected_prefix):
+                        raise ValueError("Provider returned an unsupported media type")
+                    with open(temp_path, "wb") as handle:
+                        for chunk in response.iter_bytes():
+                            if not chunk:
+                                continue
+                            total_bytes += len(chunk)
+                            if total_bytes > self._max_download_bytes:
+                                raise ValueError("Downloaded media exceeded the configured size limit")
+                            handle.write(chunk)
+                            hasher.update(chunk)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                os.replace(temp_path, destination)
+                self._directory_fsync(destination)
+                _best_effort_private_permissions(destination)
+                return content_type, total_bytes, hasher.hexdigest()
+            except (httpx.TimeoutException, httpx.RequestError) as exc:
+                with suppress(FileNotFoundError):
+                    temp_path.unlink()
+                with suppress(FileNotFoundError):
+                    destination.unlink()
+                if attempt >= self._download_max_attempts:
+                    if isinstance(exc, httpx.TimeoutException):
+                        raise TimeoutError("Provider media download timed out after bounded retries") from None
+                    raise RuntimeError("Provider media download failed after bounded retries") from None
+                self._sleeper(
+                    min(
+                        MAX_DOWNLOAD_RETRY_DELAY_SECONDS,
+                        self._download_retry_delay_seconds * (2 ** (attempt - 1)),
+                    )
+                )
+            except Exception:
+                with suppress(FileNotFoundError):
+                    temp_path.unlink()
+                with suppress(FileNotFoundError):
+                    destination.unlink()
+                raise
+
+        raise AssertionError("bounded media download loop exited unexpectedly")
 
     def save_downloaded_artifact(
         self,

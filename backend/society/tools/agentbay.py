@@ -370,18 +370,55 @@ class AgentBayTools(Toolkit):
                 raise ValueError("Control characters are not allowed")
             return text
 
+        def workspace_target(value: Any) -> str:
+            """Return one safe absolute target in the staged ``/workspace`` tree.
+
+            AgentBay sessions do not guarantee their process working directory.
+            This is the shared builder/validator contract: callers may provide
+            a relative workspace path or its equivalent absolute ``/workspace``
+            path, but the command always receives the latter.  The target is a
+            path argument, never a shell fragment, so option-like components,
+            traversal, host-style prefixes, and non-path characters are
+            rejected before command execution.
+            """
+
+            if not isinstance(value, str):
+                raise ValueError("Command target must be a string workspace path")
+            text = simple_value(value)
+            if len(text) > MAX_REMOTE_PATH_LENGTH:
+                raise ValueError("Command target exceeds maximum path length")
+            text = text.replace("\\", "/")
+            if text.startswith(("//", "~")) or re.match(r"^[A-Za-z]:", text):
+                raise ValueError("Command target must be a relative path or an absolute /workspace path")
+            path = PurePosixPath(text)
+            if path.is_absolute():
+                try:
+                    relative = path.relative_to(PurePosixPath("/workspace"))
+                except ValueError as exc:
+                    raise ValueError("Command target must be beneath /workspace") from exc
+            else:
+                relative = path
+            if not relative.parts or ".." in relative.parts:
+                raise ValueError("Command target must name a non-traversing path beneath /workspace")
+            for component in relative.parts:
+                if component.startswith("-"):
+                    raise ValueError("Command target must not contain option-like path components")
+                if not re.fullmatch(r"[A-Za-z0-9._-]+", component):
+                    raise ValueError("Command target contains unsupported path characters")
+            return str(PurePosixPath("/workspace") / relative)
+
         return {
             "pytest_target": CommandTemplate(
                 command_id="pytest_target",
                 argument_names=("target",),
-                validators={"target": simple_value},
-                render=lambda args: ("python3", "-m", "pytest", args["target"], "-q"),
+                validators={"target": workspace_target},
+                render=lambda args: ("env", "PYTHONPATH=/workspace", "python3", "-m", "pytest", args["target"], "-q"),
             ),
             "python_compile": CommandTemplate(
                 command_id="python_compile",
                 argument_names=("target",),
-                validators={"target": simple_value},
-                render=lambda args: ("python3", "-m", "compileall", args["target"]),
+                validators={"target": workspace_target},
+                render=lambda args: ("env", "PYTHONPATH=/workspace", "python3", "-m", "compileall", args["target"]),
             ),
         }
 

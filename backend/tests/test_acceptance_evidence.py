@@ -110,6 +110,8 @@ class AcceptanceEvidenceContractTests(unittest.TestCase):
         }
         events = [
             _event("local_independent_validation_reported", {"assignment_id": "validate", "passed": True}),
+            _event("agentbay_start_succeeded", {"assignment_id": "build"}),
+            _event("agentbay_start_succeeded", {"assignment_id": "validate"}),
             _event("composition_assignment_cleanup_completed", {"assignment_id": "build", "success": True, "results": [{"success": True, "closed": True}]}),
             _event("composition_assignment_cleanup_completed", {"assignment_id": "validate", "success": True, "results": [{"success": True, "closed": True}]}),
         ]
@@ -139,6 +141,8 @@ class AcceptanceEvidenceContractTests(unittest.TestCase):
         events = [
             _event("local_independent_validation_reported", {"assignment_id": "validate", "passed": True}),
             _event("agentbay_artifact_exported", {"assignment_id": "build", "path": "src/calc.py"}),
+            _event("agentbay_start_succeeded", {"assignment_id": "build"}),
+            _event("agentbay_start_succeeded", {"assignment_id": "validate"}),
             _event("composition_assignment_cleanup_completed", {"assignment_id": "build", "success": True, "results": [{"success": True, "closed": True}]}),
             _event("composition_assignment_cleanup_completed", {"assignment_id": "validate", "success": True, "results": [{"success": True, "closed": True}]}),
         ]
@@ -152,6 +156,38 @@ class AcceptanceEvidenceContractTests(unittest.TestCase):
         self.assertIn("src/calc.py", answer)
         self.assertNotIn("Blocker/Missing", answer)
         self.assertEqual(state["final_deliverable"]["validation_status"], "verified_fixed_composition")
+
+    def test_media_only_validator_does_not_require_synthetic_sandbox_cleanup(self) -> None:
+        """Media validation passes when no AgentBay environment was ever started."""
+
+        state = {
+            "proposals": {"p1": "x"}, "winner_id": "a1", "critique": {"critique": "ok"},
+            "final_deliverable": {"answer": "done"},
+            "artifacts": [{"type": "final_deliverable", "status": "final"}], "subtasks": [],
+            "demo_proof": {"verified": True, "missing_markers": []}, "prompt": "Create an image",
+            "fixed_specialist_selection": {"assignments": [
+                {"assignment_id": "image", "template_id": "image_creator"},
+                {"assignment_id": "validate", "template_id": "test_engineer"},
+            ]},
+        }
+        events = [
+            _event("local_independent_validation_reported", {"assignment_id": "validate", "passed": True}),
+            _event("composition_media_artifact_recorded", {
+                "assignment_id": "image",
+                "expected_artifact": "launch_visual.png",
+                "artifact": {"artifact_ref": "media/artifacts/artifact_example.png"},
+            }),
+        ]
+        orch = self._make_orchestrator(state, events)
+
+        orch._populate_acceptance_checks("t1", SimpleNamespace(leader_id="leader"))
+        answer = orch._verified_fixed_composition_outcome("t1")
+
+        requirements = {item["id"]: item for item in state["acceptance_evidence"]["requirements"]}
+        self.assertTrue(requirements["fixed_specialist_sandbox_cleanup"]["passed"])
+        self.assertEqual(requirements["fixed_specialist_sandbox_cleanup"]["missing_evidence"], [])
+        self.assertIsNotNone(answer)
+        self.assertIn("launch_visual.png", answer)
 
     def test_failed_fixed_checks_do_not_replace_the_prevalidation_answer(self) -> None:
         state = {
@@ -211,6 +247,8 @@ class AcceptanceEvidenceContractTests(unittest.TestCase):
         }
         orch = self._make_orchestrator(state, [
             _event("local_independent_validation_reported", {"assignment_id": "validate", "passed": False}),
+            _event("agentbay_start_succeeded", {"assignment_id": "build"}),
+            _event("agentbay_start_succeeded", {"assignment_id": "validate"}),
             _event("composition_assignment_cleanup_completed", {"assignment_id": "build", "success": False, "results": [{"success": False, "closed": False}]}),
             _event("composition_assignment_cleanup_completed", {"assignment_id": "validate", "success": True, "results": [{"success": True, "closed": True}]}),
         ])

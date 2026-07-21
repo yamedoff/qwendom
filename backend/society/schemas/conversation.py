@@ -46,6 +46,10 @@ class GoalDiscussionStatement(BaseModel):
     concerns: list[str] = Field(default_factory=list, description="Ambiguities, risks, or missing inputs")
     suggested_scope: str = Field(default="", description="Smallest useful scope to execute")
     question_for_next: str | None = Field(default=None, description="Question or challenge for the next agent")
+    question_target_agent_id: str | None = Field(
+        default=None,
+        description="Named teammate whose role owns the answer to question_for_next",
+    )
     spoken_turn: str = Field(default="", description="Short meeting-room phrasing of this contribution")
     ready: bool = Field(default=True, description="Whether this speaker is ready to proceed after their contribution")
     critical_blocker: bool = Field(default=False, description="Whether a typed blocker prevents execution")
@@ -66,6 +70,7 @@ class ConversationTurn(BaseModel):
     says: str = Field(description="Short natural-language statement for the transcript")
     quote_from_prior: str | None = Field(default=None, description="Prior point being referenced")
     question_for_next: str | None = Field(default=None, description="Question or challenge for the next speaker")
+    question_target_agent_id: str | None = Field(default=None, description="Named teammate expected to answer")
 
 
 class TargetedQuestionExchange(BaseModel):

@@ -391,6 +391,9 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
                     captured["second_result"] = await self._tools["run_code"](
                         "model-invented", "python", "assert True", 5
                     )
+                    captured["third_result"] = await self._tools["run_code"](
+                        "model-invented", "python", "assert True", 5
+                    )
                     return {"passed": True, "checks": ["real execution"], "failures": []}
 
             runtime = CompositionRuntime(
@@ -418,8 +421,9 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(captured["handle"], "runtime-owned")
-            self.assertEqual(captured["calls"], 1)
-            self.assertEqual(captured["second_result"]["error_code"], "sandbox_execution_limit_reached")
+            self.assertEqual(captured["calls"], 2)
+            self.assertTrue(captured["second_result"]["success"])
+            self.assertEqual(captured["third_result"]["error_code"], "sandbox_execution_limit_reached")
 
     def test_validator_prompt_requires_safe_real_execution_pattern(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -444,6 +448,41 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("use pure Python built-ins", prompt)
         self.assertIn("Do not import modules", prompt)
         self.assertIn("Do not call pytest_target unless", prompt)
+
+    def test_validator_prompt_requires_compile_and_pytest_for_repository_dependencies(self) -> None:
+        """Independent repository validation receives both required checks and exact target."""
+
+        with TemporaryDirectory() as temp_dir:
+            runtime = CompositionRuntime(
+                _settings(),
+                temp_dir,
+                preflight_fn=_preflight(agentbay=True, image=False, video=False),
+            )
+            prompt = runtime._assignment_executor._build_prompt(
+                assignment=_assignment(
+                    "validator",
+                    "test_engineer",
+                    required_capabilities=["test_execution", "sandbox_execution"],
+                    tool_ids=["execute_command", "report_independent_validation"],
+                ),
+                tool_ids=["execute_command", "report_independent_validation"],
+                skill_instructions=["verified skill"],
+                direct_dependency_outputs={
+                    "builder": {
+                        "artifact_refs": ["repo/payment_retry.py", "repo/test_payment_retry.py"],
+                        "workspace_exports": [
+                            {"workspace_relative_path": "repo/payment_retry.py"},
+                            {"workspace_relative_path": "repo/test_payment_retry.py"},
+                        ],
+                    }
+                },
+                user_request="validate the repository",
+            )
+
+        self.assertIn('command_id `python_compile`', prompt)
+        self.assertIn('command_id `pytest_target`', prompt)
+        self.assertIn('/workspace/repo/test_payment_retry.py', prompt)
+        self.assertIn('Both real execution events are mandatory', prompt)
 
     def test_validator_compile_does_not_recover_failed_test_execution(self) -> None:
         assignment = _assignment(
@@ -1167,7 +1206,17 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
             def load_artifact_manifest(self, value: str) -> dict[str, Any]:
                 if value != artifact_id:
                     raise AssertionError(f"Unexpected media artifact ID: {value}")
-                return {"artifact_id": value, "kind": "image", "provenance_complete": True}
+                return {
+                    "artifact_id": value,
+                    "kind": "image",
+                    "provenance_complete": True,
+                    "local_relative_path": f"artifacts/{value}.png",
+                    "sha256": "a" * 64,
+                    "model_id": "qwen-image-test",
+                    "mime_type": "image/png",
+                    "width": 1792,
+                    "height": 1008,
+                }
 
         class FakeImageToolkit:
             def __init__(self, *, event_sink: Any, **kwargs: Any) -> None:
@@ -1222,14 +1271,27 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
             )
 
             output = result.node_outputs["image-node"]
-            self.assertEqual(output["artifact_refs"], [artifact_id])
-            self.assertEqual(output["media_artifacts"], [{"expected_artifact": "launch_visual_16x9.png", "artifact_id": artifact_id, "kind": "image"}])
+            task_relative = f"media/artifacts/{artifact_id}.png"
+            self.assertEqual(output["artifact_refs"], [task_relative])
+            self.assertEqual(output["media_artifacts"][0]["expected_artifact"], "launch_visual_16x9.png")
+            self.assertEqual(output["media_artifacts"][0]["artifact_ref"], task_relative)
+            self.assertEqual(output["media_artifacts"][0]["task_relative_path"], task_relative)
+            self.assertEqual(output["media_artifacts"][0]["model_id"], "qwen-image-test")
+            self.assertEqual(output["media_artifacts"][0]["width"], 1792)
+            self.assertEqual(output["media_artifacts"][0]["height"], 1008)
+            self.assertEqual(output["media_artifacts"][0]["publication_state"], "unknown")
+            self.assertEqual(
+                output["media_artifacts"][0]["semantic_validation"]["status"],
+                "human_review_required",
+            )
 
-    async def test_image_creator_retries_when_first_turn_omits_generation(self) -> None:
-        """Image specialists get one correction turn instead of completing from prose."""
+    async def test_image_creator_enforces_generation_when_model_omits_tool_call(self) -> None:
+        """The runtime performs the real provider call when the model returns prose."""
 
         artifact_id = "artifact_" + ("b" * 32)
         agent_calls = 0
+        prompts: list[str] = []
+        generation_calls: list[dict[str, Any]] = []
 
         class FakeMediaStore:
             def __init__(self, _root: Path) -> None:
@@ -1238,14 +1300,22 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
             def load_artifact_manifest(self, value: str) -> dict[str, Any]:
                 if value != artifact_id:
                     raise AssertionError(f"Unexpected media artifact ID: {value}")
-                return {"artifact_id": value, "kind": "image", "provenance_complete": True}
+                return {
+                    "artifact_id": value,
+                    "kind": "image",
+                    "provenance_complete": True,
+                    "local_relative_path": f"artifacts/{value}.png",
+                    "width": 1792,
+                    "height": 1008,
+                }
 
         class FakeImageToolkit:
             def __init__(self, *, event_sink: Any, **kwargs: Any) -> None:
                 del kwargs
                 self._event_sink = event_sink
 
-            def generate_images(self) -> dict[str, Any]:
+            def generate_images(self, **kwargs: Any) -> dict[str, Any]:
+                generation_calls.append(dict(kwargs))
                 result = {"success": True, "data": {"artifact_ids": [artifact_id]}}
                 self._event_sink(result)
                 return result
@@ -1253,8 +1323,9 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
             def inspect_image(self) -> None:
                 return None
 
-            def publish_image(self) -> None:
-                return None
+            def publish_image(self, artifact_id: str, purpose: str) -> dict[str, Any]:
+                del artifact_id, purpose
+                return {"success": True}
 
         class FakeAgent:
             def __init__(self, tools: list[Any]) -> None:
@@ -1263,10 +1334,8 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
             async def arun(self, prompt: str) -> dict[str, Any]:
                 nonlocal agent_calls
                 agent_calls += 1
-                if agent_calls == 1:
-                    return {"summary": "I would generate the visual."}
-                self._tools["generate_images"]()
-                return {"summary": "Generated the visual."}
+                prompts.append(prompt)
+                return {"summary": "I would generate the visual."}
 
         with TemporaryDirectory() as temp_dir:
             assignment = _assignment(
@@ -1280,6 +1349,7 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
             assignment.tool_bundle_hash = bundle.tool_bundle_hash
             assignment.resolved_skills = bundle.skills
             assignment.expected_artifacts = ["launch_visual_16x9.png"]
+            assignment.objective = "Create a 16:9 visual with four specialists and no text."
             runtime = CompositionRuntime(
                 _settings(),
                 temp_dir,
@@ -1292,11 +1362,162 @@ class AgnoAssignmentExecutorTests(unittest.IsolatedAsyncioTestCase):
             result = await runtime.execute_plan(
                 _plan([assignment], [WorkNode(id="image-node", assignment_id="image")]),
                 "task",
-                "request",
+                "Use deep navy and violet. No logos, text, or watermarks.",
             )
 
-            self.assertEqual(agent_calls, 2)
-            self.assertEqual(result.node_outputs["image-node"]["artifact_refs"], [artifact_id])
+            self.assertEqual(agent_calls, 1)
+            self.assertEqual(
+                result.node_outputs["image-node"]["artifact_refs"],
+                [f"media/artifacts/{artifact_id}.png"],
+            )
+            self.assertIn("four specialists and no text", generation_calls[0]["prompt"])
+            self.assertIn("No logos, text, or watermarks", generation_calls[0]["prompt"])
+            self.assertEqual(generation_calls[0]["width"], 1792)
+            self.assertEqual(generation_calls[0]["height"], 1008)
+
+    async def test_mismatched_recorded_image_dimensions_are_not_accepted(self) -> None:
+        """A square provider artifact cannot satisfy an explicit 16:9 request."""
+
+        artifact_id = "artifact_" + ("d" * 32)
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        class FakeMediaStore:
+            def __init__(self, _root: Path) -> None:
+                pass
+
+            def load_artifact_manifest(self, value: str) -> dict[str, Any]:
+                if value != artifact_id:
+                    raise AssertionError(f"Unexpected artifact ID: {value}")
+                return {
+                    "artifact_id": value,
+                    "kind": "image",
+                    "provenance_complete": True,
+                    "local_relative_path": f"artifacts/{value}.png",
+                    "width": 1024,
+                    "height": 1024,
+                }
+
+        class FakeImageToolkit:
+            def __init__(self, *, event_sink: Any, **kwargs: Any) -> None:
+                del kwargs
+                self._event_sink = event_sink
+
+            def generate_images(self, **_kwargs: Any) -> dict[str, Any]:
+                result = {"success": True, "data": {"artifact_ids": [artifact_id]}}
+                self._event_sink(result)
+                return result
+
+            def inspect_image(self) -> None:
+                return None
+
+            def publish_image(self, artifact_id: str, purpose: str) -> dict[str, Any]:
+                del artifact_id, purpose
+                return {"success": True}
+
+        class FakeAgent:
+            def __init__(self, tools: list[Any]) -> None:
+                self._tools = {getattr(tool, "__name__", type(tool).__name__): tool for tool in tools}
+
+            async def arun(self, _prompt: str) -> dict[str, Any]:
+                self._tools["generate_images"]()
+                return {"summary": "Generated an image."}
+
+        with TemporaryDirectory() as temp_dir:
+            assignment = _assignment(
+                "image",
+                "image_creator",
+                required_capabilities=["image_generation"],
+                tool_ids=["generate_images", "inspect_image", "publish_image"],
+            )
+            bundle = resolve_specialist_bundle("image_creator")
+            assignment.template_version = bundle.template.version
+            assignment.tool_bundle_hash = bundle.tool_bundle_hash
+            assignment.resolved_skills = bundle.skills
+            assignment.expected_artifacts = ["launch_visual_16x9.png"]
+            assignment.objective = "Create a 16×9 launch visual."
+            runtime = CompositionRuntime(
+                _settings(),
+                temp_dir,
+                preflight_fn=_preflight(agentbay=False),
+                build_agent_factory=lambda identity, settings, **kwargs: FakeAgent(kwargs["tools"]),
+                image_toolkit_factory=FakeImageToolkit,
+                media_store_factory=FakeMediaStore,
+                event_sink=lambda event_type, payload: events.append((event_type, dict(payload))),
+            )
+
+            result = await runtime.execute_plan(
+                _plan([assignment], [WorkNode(id="image-node", assignment_id="image")]),
+                "task",
+                "Create the requested 16:9 visual.",
+            )
+
+            record = result.graph_result.nodes["image-node"]
+            self.assertEqual(record.status, WorkNodeStatus.FAILED)
+            self.assertEqual(record.attempts[-1].code, "generated_media_contract_failed")
+            correction = next(payload for event_type, payload in events if event_type == "composition_media_correction_completed")
+            self.assertEqual(correction["expected_dimensions"], (1792, 1008))
+            self.assertFalse(correction["generated"])
+            self.assertIn("composition_media_validation_failed", [event_type for event_type, _payload in events])
+
+    async def test_validator_preserves_human_review_warning_for_generated_media(self) -> None:
+        """Metadata validation can finish while visual semantics remain unapproved."""
+
+        events: list[tuple[str, dict[str, Any]]] = []
+        with TemporaryDirectory() as temp_dir:
+            artifact = Path(temp_dir) / "validation.txt"
+            artifact.write_text("machine evidence", encoding="utf-8")
+
+            class FakeAgent:
+                def __init__(self, tools: list[Any]) -> None:
+                    self._tools = {getattr(tool, "__name__", type(tool).__name__): tool for tool in tools}
+
+                async def arun(self, _prompt: str) -> dict[str, Any]:
+                    inspected = self._tools["inspect_artifact"](str(artifact))
+                    report = self._tools["report_independent_validation"](
+                        True,
+                        ["hash and dimensions recorded"],
+                        [],
+                        [inspected["artifact_ref"]],
+                        "metadata is intact",
+                    )
+                    return report
+
+            runtime = CompositionRuntime(
+                _settings(),
+                temp_dir,
+                preflight_fn=_preflight(agentbay=False, image=False, video=False),
+                build_agent_factory=lambda identity, settings, **kwargs: FakeAgent(kwargs["tools"]),
+                event_sink=lambda event_type, payload: events.append((event_type, dict(payload))),
+            )
+            assignment = _assignment(
+                "validator",
+                "test_engineer",
+                required_capabilities=["test_execution"],
+                tool_ids=["inspect_artifact", "report_independent_validation"],
+            )
+            from society.composition_runtime import _build_assignment_identity
+
+            result = await runtime._assignment_executor(
+                node=WorkNode(id="validator", assignment_id="validator"),
+                assignment=assignment,
+                materialized_agent=_build_assignment_identity(assignment),
+                direct_dependency_outputs={
+                    "image-node": {
+                        "media_artifacts": [{
+                            "artifact_ref": "media/artifacts/artifact_example.png",
+                            "semantic_validation": {"status": "human_review_required"},
+                        }],
+                    },
+                },
+                attempt=1,
+                cancellation_event=asyncio.Event(),
+            )
+
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["semantic_validation"], "human_review_required")
+            self.assertIn("require human review", result["warnings"][0])
+            finding = next(payload for event_type, payload in events if event_type == "composition_validator_finding")
+            self.assertEqual(finding["evidence"]["semantic_validation"], "human_review_required")
 
     async def test_event_backed_negative_validation_fails_when_model_omits_fields(self) -> None:
         with TemporaryDirectory() as temp_dir:

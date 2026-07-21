@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from society.tools.local_artifacts import LocalArtifactTools, MAX_INSPECT_BYTES
+from society.tools.local_artifacts import LocalArtifactTools, MAX_HASH_BYTES, MAX_INSPECT_BYTES
 
 
 def make_tools(tmp_path: Path, *, role_key: str = "test_engineer", event_sink=None) -> LocalArtifactTools:
@@ -42,7 +42,7 @@ def test_inspect_artifact_rejects_path_escape_and_missing_files(tmp_path: Path) 
     assert missing["error_code"] == "artifact_inspection_failed"
 
 
-def test_inspect_artifact_rejects_directories_and_oversized_files(tmp_path: Path) -> None:
+def test_inspect_artifact_rejects_directories_but_streams_large_binary_metadata(tmp_path: Path) -> None:
     folder = tmp_path / "dir"
     folder.mkdir()
     oversized = tmp_path / "big.bin"
@@ -52,7 +52,36 @@ def test_inspect_artifact_rejects_directories_and_oversized_files(tmp_path: Path
     oversized_result = make_tools(tmp_path).inspect_artifact("big.bin")
 
     assert folder_result["success"] is False
-    assert oversized_result["success"] is False
+    assert oversized_result["success"] is True
+    assert oversized_result["size_bytes"] == MAX_INSPECT_BYTES + 1
+    assert oversized_result["is_text"] is False
+
+
+def test_inspect_artifact_reports_png_dimensions_without_loading_image_content(tmp_path: Path) -> None:
+    artifact = tmp_path / "media" / "artifacts" / "visual.png"
+    artifact.parent.mkdir(parents=True)
+    png_header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (1792).to_bytes(4, "big") + (1008).to_bytes(4, "big")
+    artifact.write_bytes(png_header + (b"x" * ((1024 * 1024) - len(png_header))))
+
+    result = make_tools(tmp_path).inspect_artifact("media/artifacts/visual.png")
+
+    assert result["success"] is True
+    assert result["mime_type"] == "image/png"
+    assert result["width"] == 1792
+    assert result["height"] == 1008
+    assert result["content"] is None
+    assert len(result["sha256"]) == 64
+
+
+def test_inspect_artifact_rejects_oversized_files_without_hashing_them(tmp_path: Path) -> None:
+    artifact = tmp_path / "too-large.bin"
+    with artifact.open("wb") as handle:
+        handle.truncate(MAX_HASH_BYTES + 1)
+
+    result = make_tools(tmp_path).inspect_artifact("too-large.bin")
+
+    assert result["success"] is False
+    assert result["artifact_ref"] == "invalid-artifact-ref"
 
 
 def test_inspect_artifact_rejects_symlink_paths(tmp_path: Path) -> None:
@@ -106,7 +135,35 @@ def test_report_independent_validation_accepts_json_object_evidence(tmp_path: Pa
 
     assert result["checks"] == ["compile: PASS", "behavior: FAIL"]
     assert result["failures"] == ["behavior: expected support scope"]
-    assert result["inspected_artifact_refs"] == ["auth: agentbay/producer/auth.py"]
+    assert result["inspected_artifact_refs"] == ["agentbay/producer/auth.py"]
+
+
+def test_report_independent_validation_converts_task_absolute_ref_to_safe_relative(tmp_path: Path) -> None:
+    target = tmp_path / "agentbay" / "producer" / "auth.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("print('ok')", encoding="utf-8")
+
+    result = make_tools(tmp_path).report_independent_validation(
+        passed=True,
+        checks=["inspected"],
+        failures=[],
+        inspected_artifact_refs=[str(target)],
+        summary="valid",
+    )
+
+    assert result["inspected_artifact_refs"] == ["agentbay/producer/auth.py"]
+
+
+def test_report_independent_validation_drops_absolute_ref_outside_task_root(tmp_path: Path) -> None:
+    result = make_tools(tmp_path).report_independent_validation(
+        passed=True,
+        checks=["inspected"],
+        failures=[],
+        inspected_artifact_refs=[str(tmp_path.parent / "outside.py")],
+        summary="invalid ref",
+    )
+
+    assert result["inspected_artifact_refs"] == []
 
 
 def test_report_independent_validation_decodes_json_string_arrays(tmp_path: Path) -> None:

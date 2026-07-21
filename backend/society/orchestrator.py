@@ -322,6 +322,24 @@ def _prompt_requires_validation(prompt: str) -> bool:
     )
 
 
+def _is_substantive_targeted_question(question: str) -> bool:
+    """Reject replayed ceremonial handoffs before they create a fake exchange."""
+
+    normalized = " ".join(question.lower().split())
+    if len(normalized) < 12 or "?" not in normalized:
+        return False
+    if any(marker in normalized for marker in (
+        "are we ready", "should we proceed", "can we proceed", "shall we continue",
+        "should we continue", "who goes next", "any questions",
+    )):
+        return False
+    return any(marker in normalized for marker in (
+        "risk", "missing", "unknown", "evidence", "fact", "conflict", "contradict",
+        "tradeoff", "test", "verify", "acceptance", "criterion", "decide", "decision",
+        "should ", "whether ", "which ",
+    ))
+
+
 def _is_execution_output_blocker(reason: str) -> bool:
     """Identify circular readiness objections that demand work-phase outputs.
 
@@ -1881,7 +1899,9 @@ class SocietyOrchestrator:
         The first call lists the runtime-available repository catalog. The
         second call accepts only assignment fields controlled by the leader.
         Resolution attaches tools, skills, resource policy, and replay hashes
-        after schema validation. One bounded correction is allowed.
+        after schema validation. Two bounded correction turns are allowed so a
+        leader can address a second, newly exposed typed blocker without an
+        unbounded selection loop.
         """
 
         leader = self.agents.get(team.leader_id or "")
@@ -1911,7 +1931,9 @@ class SocietyOrchestrator:
         valid_template_ids = sorted(entry.template_id for entry in catalog)
         blockers: list[dict[str, Any]] = []
         resolved = None
-        for attempt in (1, 2):
+        selection_attempt_count = 0
+        for attempt in (1, 2, 3):
+            selection_attempt_count = attempt
             correction = (
                 "\nThe previous selection was rejected. Correct only these blockers: "
                 + json.dumps(blockers, sort_keys=True)
@@ -1923,6 +1945,14 @@ class SocietyOrchestrator:
                 "You may provide only template_id, assignment_id, objective, depends_on, "
                 "owned_artifacts, and acceptance_requirements. Never provide tools, skills, "
                 "credentials, locks, providers, or sandbox policy.\n"
+                "Every assignment that owns an artifact must be listed directly in depends_on for at least one "
+                "Test Engineer assignment; transitive dependency is not sufficient because validators receive only direct "
+                "dependency outputs. A Test Engineer validates artifacts but must not own or create product artifacts.\n"
+                "Treat people, agents, objects, or scenes requested inside a generated image as artifact content, not as "
+                "runtime team-size requirements. Add runtime specialists only when the user explicitly assigns them work.\n"
+                "For generated images, generate_images accepts explicit width and height. The runtime—not publish_image—"
+                "adds semantic_validation.status=human_review_required to the canonical media envelope whenever no vision "
+                "validator is wired. Do not invent or request a custom provider metadata field for that status.\n"
                 f"Task: {task.prompt}\n"
                 f"Acceptance requirements: {json.dumps(context.acceptance_requirements)}\n"
                 f"Authoritative repository catalog: {json.dumps(authoritative_catalog, sort_keys=True)}"
@@ -1935,7 +1965,10 @@ class SocietyOrchestrator:
                 "select_specialists",
                 SelectSpecialistsCall,
                 prompt,
-                ["Builder artifacts requiring acceptance must have a dependent Test Engineer assignment."],
+                [
+                    "Every artifact-producing assignment must be a direct dependency of a Test Engineer assignment.",
+                    "A Test Engineer must not own or create product artifacts.",
+                ],
             )
             try:
                 resolved = await coordinator.select_specialists(
@@ -1947,7 +1980,7 @@ class SocietyOrchestrator:
                 break
             except SpecialistSelectionError as exc:
                 blockers = [blocker.model_dump(mode="json") for blocker in exc.blockers]
-                if attempt == 2:
+                if attempt == 3:
                     raise
 
         if resolved is None:  # pragma: no cover - defensive; loop either resolves or raises.
@@ -1966,7 +1999,7 @@ class SocietyOrchestrator:
         }
         return TeamCompositionResult(
             plan=resolved.plan,
-            attempt_count=2 if blockers else 1,
+            attempt_count=selection_attempt_count,
             recomposed=bool(blockers),
             validation_issue_history=[],
         )
@@ -2445,8 +2478,10 @@ class SocietyOrchestrator:
         for attempt in range(1, max_readiness_attempts + 1):
             state["readiness_attempt_count"] = attempt
             await self._run_goal_discussion_round(task, team, max_discussion_rounds)
-            if not self.settings.efficient_society_enabled:
-                await self._run_targeted_question_exchange(task, team)
+            # Efficiency mode removes redundant all-pairs deliberation, not the
+            # single direct answer that turns a named question into a real
+            # exchange. This stays bounded to one Q&A per mission.
+            await self._run_targeted_question_exchange(task, team)
             if self.settings.readiness_voting_enabled:
                 if self.settings.efficient_society_enabled:
                     ballot_results = self._combined_discussion_readiness_ballots(task, team, attempt)
@@ -2480,6 +2515,11 @@ class SocietyOrchestrator:
         round_num = state["discussion_round_count"]
         prior_blockers = state.get("readiness_tally", {}).get("blockers", [])
         specialist_catalog = state.get("fixed_specialist_catalog", [])
+        meeting_roster = {
+            member_id: self.agents[member_id].role
+            for member_id in team.member_ids
+            if member_id in self.agents
+        }
         self._emit(task.id, "goal_discussion_started", f"Goal discussion round {round_num} started.", payload={"round": round_num, "max_rounds": max_rounds})
         for agent_id in team.member_ids:
             agent = self.agents[agent_id]
@@ -2512,17 +2552,26 @@ class SocietyOrchestrator:
                     f"Prior readiness blockers:\n{blocker_context}\n"
                     f"Conversation so far:\n{transcript}\n"
                     f"Previous speaker to respond to: {previous_agent or 'none'}.\n"
+                    f"Meeting roster and role ownership: {json.dumps(meeting_roster, sort_keys=True)}\n"
                     f"Verified fixed-specialist catalog for this mission: {json.dumps(specialist_catalog, sort_keys=True)}\n"
                     "Act like a human teammate in a short planning meeting. "
                     "Do not restate the full task. Do not repeat prior points unless you explicitly challenge or refine them. "
+                    "Treat people, agents, objects, and scenes described inside a requested image as image content, not as "
+                    "runtime specialist assignments or team-size requirements. "
+                    "For generated images, generate_images accepts explicit width and height, and the runtime records "
+                    "semantic_validation.status=human_review_required in the canonical media envelope; publish_image does "
+                    "not need a custom metadata field for this. "
                     "If you agree, say what you add. If you disagree, say what should change. "
-                    "Set responds_to to the previous speaker when there is one. "
+                    "Set responds_to to the prior speaker whose claim you are actually addressing; do not force a reply to "
+                    "the immediately previous speaker when another teammate owns the relevant claim. "
                     "Set stance to one of builds_on, challenges, clarifies, blocks. "
                     "Put the new value you add in unique_contribution. "
                     "Keep interpretation and suggested_scope concise. "
                     "Set spoken_turn to one or two short sentences that sound like a teammate in a meeting. "
-                    "The spoken turn must respond to the previous speaker when there is one. "
-                    "Ask question_for_next when the next agent should resolve something. "
+                    "The spoken turn must address the teammate named in responds_to when there is one. "
+                    "Ask question_for_next only for a concrete unresolved decision. When you ask one, set "
+                    "question_target_agent_id to the roster member whose role owns the answer. Do not ask a teammate for "
+                    "information outside their role, and do not ask procedural questions such as whether to continue. "
                     "Also cast your readiness decision in this same tool call. Set ready=false and "
                     "critical_blocker=true only for missing_user_input, missing_system_capability, "
                     "or safety_or_policy. Future work and ordinary risk do not block execution. "
@@ -2553,16 +2602,24 @@ class SocietyOrchestrator:
             ):
                 live_discussions.append(statement.model_dump())
             self._emit(task.id, "agent_goal_opinion", f"{agent.name} shared their view of the goal.", actor=agent_id, payload=statement.model_dump())
-            self._record_conversation_turn(task.id, statement, len(prior_turns) + 1, prior_turns[-1] if prior_turns else None)
+            referenced_turn = next(
+                (
+                    item
+                    for item in reversed(prior_turns)
+                    if statement.responds_to and item.get("agent_id") == statement.responds_to
+                ),
+                prior_turns[-1] if prior_turns else None,
+            )
+            self._record_conversation_turn(task.id, statement, len(prior_turns) + 1, referenced_turn)
             self._record_position_from_discussion(task.id, statement)
 
     async def _run_targeted_question_exchange(self, task: TaskRun, team: Team) -> None:
         """Resolve one named agent question before readiness voting.
 
         This keeps the meeting-room transcript conversational without adding an
-        unbounded debate loop. The first unanswered question from the current
-        round is assigned to the next roster member, answered, and carried into
-        the working brief as evidence or an assumption.
+        unbounded debate loop. An explicit valid target is honored; incomplete
+        legacy events use a safe available-teammate fallback so replay remains
+        compatible with transcripts that predate target fields.
         """
 
         state = self._state(task.id)
@@ -2578,13 +2635,72 @@ class SocietyOrchestrator:
         if not question_turn:
             return
         asker_id = str(question_turn.get("agent_id"))
-        asker_index = team.member_ids.index(asker_id) if asker_id in team.member_ids else -1
-        target_id = team.member_ids[(asker_index + 1) % len(team.member_ids)]
-        if target_id == asker_id and len(team.member_ids) > 1:
-            target_id = team.member_ids[0]
+        requested_target = str(question_turn.get("question_target_agent_id") or "")
+        question = str(question_turn.get("question_for_next") or "")
+        if not _is_substantive_targeted_question(question):
+            self._emit(
+                task.id,
+                "targeted_question_rejected",
+                "A procedural or underspecified question was not routed as debate.",
+                actor=asker_id,
+                payload={"asker_id": asker_id, "question": question[:300]},
+            )
+            return
+        available_targets = [
+            member_id
+            for member_id in team.member_ids
+            if member_id in self.agents and member_id != asker_id
+        ]
+        if not available_targets:
+            self._emit(
+                task.id,
+                "targeted_question_unroutable",
+                "No available teammate could answer the targeted question.",
+                actor=asker_id,
+                payload={"asker_id": asker_id, "requested_target_agent_id": requested_target},
+            )
+            return
+        target_id = requested_target if requested_target in available_targets else available_targets[0]
         target = self.agents[target_id]
-        question = str(question_turn.get("question_for_next"))
-        answer = self._answer_targeted_question(target, question, task.prompt)
+        answer_context = (
+            f"You are {target.name}, the {target.role}, in a live planning discussion. "
+            f"{asker_id} asked you directly: {question}\n"
+            "Answer the question yourself in one or two concise sentences. Give a concrete decision, fact, risk, "
+            "or test that follows from your role. If evidence is missing, say exactly what is unverified and what "
+            "would resolve it. Do not describe the meeting process, do not ask whether to continue, and do not "
+            "pretend a check ran when it did not."
+        )
+        try:
+            answer = " ".join(
+                (await self._ask_agent(target, task.prompt, answer_context, task.id)).split()
+            ).strip()[:900]
+        except Exception as exc:
+            self._emit(
+                task.id,
+                "targeted_question_unavailable",
+                f"{target.name}'s targeted answer was unavailable.",
+                actor=target_id,
+                payload={
+                    "asker_id": asker_id,
+                    "target_agent_id": target_id,
+                    "question": question[:300],
+                    "reason": str(exc)[:300],
+                },
+            )
+            return
+        if not answer:
+            self._emit(
+                task.id,
+                "targeted_question_unavailable",
+                f"{target.name} returned no targeted answer.",
+                actor=target_id,
+                payload={
+                    "asker_id": asker_id,
+                    "target_agent_id": target_id,
+                    "question": question[:300],
+                },
+            )
+            return
         resolved = not any(word in answer.lower() for word in ("cannot resolve", "need user", "blocked"))
         assumption = None if resolved else f"Proceed only if this remains acceptable: {question}"
         exchange = TargetedQuestionExchange(
@@ -2617,22 +2733,11 @@ class SocietyOrchestrator:
             concerns=[] if resolved else [question],
             suggested_scope="Use the answer as the handoff assumption for readiness.",
             question_for_next=None,
+            question_target_agent_id=None,
             spoken_turn=f"{target.name}: On {asker_id}'s question, {answer}",
         )
         state.setdefault("goal_discussions", []).append(answer_statement.model_dump())
         self._record_conversation_turn(task.id, answer_statement, len(current_round) + 1, question_turn)
-
-    def _answer_targeted_question(self, agent: SocietyAgent, question: str, task_prompt: str) -> str:
-        """Create a concise role-grounded answer for the targeted Q&A loop."""
-
-        role = agent.role.lower()
-        if "research" in role:
-            return f"I can validate the weakest assumption first and label anything unverified; for now, treat '{question}' as an evidence gap."
-        if "implementation" in role:
-            return f"I can own the first runnable check and keep scope narrow; if '{question}' stays open, I will ship with that caveat visible."
-        if "review" in role or "critic" in role:
-            return f"I will accept proceeding only if the final answer carries this risk explicitly: {question}"
-        return f"I will keep the system boundary clear and make '{question}' an explicit assumption in the plan for {task_prompt[:80]}."
 
     def _record_conversation_turn(
         self,
@@ -2659,6 +2764,7 @@ class SocietyOrchestrator:
             says=says,
             quote_from_prior=prior_quote,
             question_for_next=statement.question_for_next,
+            question_target_agent_id=statement.question_target_agent_id,
         )
         payload = turn.model_dump()
         self._state(task_id).setdefault("conversation_transcript", []).append(payload)
@@ -2853,6 +2959,11 @@ class SocietyOrchestrator:
                 "and remediation to what must happen to resolve the blocker. "
                 "Do not block because research, implementation, validation, votes, or final artifacts are not yet complete; "
                 "those are future_work, not blocking prerequisites. "
+                "Do not treat people, agents, objects, or scenes requested inside a generated image as runtime team members; "
+                "they are artifact content unless the user explicitly assigns those roles work. "
+                "The verified media contract is: generate_images accepts width and height, and the runtime automatically "
+                "records semantic_validation.status=human_review_required in the canonical media envelope when no vision "
+                "validator exists. Never block to ask publish_image for a custom metadata key. "
                 "Block only for ambiguous user intent, contradictory constraints, "
                 "unavailable required capabilities, or a decision that only the user can make. "
                 "Call cast_readiness_vote with your exact agent_id."
@@ -6433,15 +6544,16 @@ class SocietyOrchestrator:
         if not validator_assignment_ids:
             return None
 
+        task_events = self._safe_list_events(task_id)
         validation_events = [
-            event for event in self._safe_list_events(task_id)
+            event for event in task_events
             if event.type == "local_independent_validation_reported"
             and isinstance(event.payload, dict)
             and str(event.payload.get("assignment_id")) in validator_assignment_ids
         ]
         latest_validation = validation_events[-1] if validation_events else None
         cleanup_events = [
-            event for event in self._safe_list_events(task_id)
+            event for event in task_events
             if event.type == "composition_assignment_cleanup_completed"
             and isinstance(event.payload, dict)
             and str(event.payload.get("assignment_id")) in expected_assignment_ids
@@ -6457,7 +6569,18 @@ class SocietyOrchestrator:
                 for result in event.payload["results"]
             )
         }
-        missing_cleanup = sorted(expected_assignment_ids - successful_cleanup_assignment_ids)
+        started_sandbox_assignment_ids = {
+            str(event.payload["assignment_id"])
+            for event in task_events
+            if event.type == "agentbay_start_succeeded"
+            and isinstance(event.payload, dict)
+            and str(event.payload.get("assignment_id")) in expected_assignment_ids
+        }
+        # Cleanup is mandatory for every environment that actually started.
+        # Media-only specialists deliberately use no AgentBay environment, so
+        # requiring a synthetic close event for them would turn successful
+        # artifact validation into a false terminal failure.
+        missing_cleanup = sorted(started_sandbox_assignment_ids - successful_cleanup_assignment_ids)
         return {
             "validation_passed": bool(latest_validation and latest_validation.payload.get("passed") is True),
             "validation_event_ids": [event.id for event in validation_events],
@@ -7179,19 +7302,25 @@ class SocietyOrchestrator:
 
         artifact_refs: list[str] = []
         for event in self._safe_list_events(task_id):
-            if event.type != "agentbay_artifact_exported" or not isinstance(event.payload, dict):
+            if not isinstance(event.payload, dict):
                 continue
             payload = event.payload
-            reference = payload.get("workspace_relative_path") or payload.get("path")
-            artifact_ref = payload.get("artifact_ref")
-            if not reference and isinstance(artifact_ref, dict):
-                reference = artifact_ref.get("storage_path") or artifact_ref.get("workspace_relative_path")
+            if event.type == "agentbay_artifact_exported":
+                reference = payload.get("workspace_relative_path") or payload.get("path")
+                artifact_ref = payload.get("artifact_ref")
+                if not reference and isinstance(artifact_ref, dict):
+                    reference = artifact_ref.get("storage_path") or artifact_ref.get("workspace_relative_path")
+            elif event.type == "composition_media_artifact_recorded":
+                artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {}
+                reference = payload.get("expected_artifact") or artifact.get("artifact_ref") or artifact.get("artifact_id")
+            else:
+                continue
             if isinstance(reference, str) and reference.strip() and reference.strip() not in artifact_refs:
                 artifact_refs.append(reference.strip())
         artifact_text = ", ".join(artifact_refs[:6]) if artifact_refs else "the exported artifact references recorded by the runtime"
         return (
-            "Verified runtime outcome: the fixed Builder/Test Engineer execution passed independent validation, "
-            f"exported {artifact_text}, and closed every selected execution environment successfully. "
+            "Verified runtime outcome: the fixed-specialist execution passed independent validation, "
+            f"delivered {artifact_text}, and cleaned up every execution environment it started. "
             "Pre-validation deliberation remains in the event history and is not the terminal verdict."
         )
 

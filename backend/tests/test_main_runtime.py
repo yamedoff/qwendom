@@ -118,6 +118,50 @@ class ArtifactDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.headers["content-disposition"].split(";", 1)[0], "inline")
             self.assertEqual(response.media_type, "text/plain")
 
+    async def test_lists_and_views_recorded_media_artifact(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "media" / "artifacts" / "visual.png"
+            target.parent.mkdir(parents=True)
+            payload = b"\x89PNG\r\n\x1a\nfixture"
+            target.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            event = SimpleNamespace(
+                type="composition_media_artifact_recorded",
+                payload={
+                    "producer": "image_creator",
+                    "expected_artifact": "launch_visual.png",
+                    "artifact": {
+                        "artifact_id": "artifact-image",
+                        "kind": "image",
+                        "local_relative_path": "media/artifacts/visual.png",
+                        "sha256": digest,
+                        "byte_size": len(payload),
+                    },
+                },
+            )
+            validation = SimpleNamespace(
+                type="local_independent_validation_reported",
+                payload={"passed": True, "inspected_artifact_refs": ["media/artifacts/visual.png"]},
+            )
+            fake_society = Mock()
+            fake_society.list_events.return_value = [event, validation]
+            fake_society.get_task_summary.return_value = {"id": "task-1"}
+            fake_society._composition_artifact_root.return_value = root
+
+            with patch.object(main, "society", fake_society):
+                artifacts = await main.task_artifacts("task-1")
+                response = await main.task_artifact_view("task-1", "artifact-image")
+
+            self.assertEqual(artifacts[0]["path"], "launch_visual.png")
+            self.assertEqual(artifacts[0]["producer"], "image_creator")
+            self.assertEqual(artifacts[0]["status"], "available")
+            self.assertEqual(artifacts[0]["media_type"], "image/png")
+            self.assertEqual(artifacts[0]["sha256"], digest)
+            self.assertEqual(artifacts[0]["validation_status"], "passed")
+            self.assertEqual(artifacts[0]["view_url"], "/tasks/task-1/artifacts/artifact-image/view")
+            self.assertEqual(response.media_type, "image/png")
+
     async def test_list_reports_missing_export_without_exposing_storage_path(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -138,6 +182,38 @@ class ArtifactDownloadTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(artifacts[0]["status"], "missing")
             self.assertNotIn("private/missing.mp4", str(artifacts[0]))
+
+    async def test_hash_mismatch_is_listed_but_cannot_be_downloaded(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "media" / "artifacts" / "tampered.png"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"tampered")
+            event = SimpleNamespace(
+                type="composition_media_artifact_recorded",
+                payload={
+                    "expected_artifact": "launch_visual.png",
+                    "artifact": {
+                        "artifact_id": "artifact-tampered",
+                        "kind": "image",
+                        "local_relative_path": "media/artifacts/tampered.png",
+                        "sha256": "a" * 64,
+                    },
+                },
+            )
+            fake_society = Mock()
+            fake_society.list_events.return_value = [event]
+            fake_society.get_task_summary.return_value = {"id": "task-1"}
+            fake_society._composition_artifact_root.return_value = root
+
+            with patch.object(main, "society", fake_society):
+                artifacts = await main.task_artifacts("task-1")
+                with self.assertRaises(HTTPException) as raised:
+                    await main.task_artifact("task-1", "artifact-tampered")
+
+            self.assertEqual(artifacts[0]["status"], "integrity_failed")
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertNotIn(str(root), str(artifacts[0]))
 
     async def test_list_correlates_explicit_artifact_validation_evidence(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -165,7 +241,7 @@ class ArtifactDownloadTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(artifacts[0]["validation_status"], "failed")
 
-    async def test_list_correlates_absolute_inspection_path_without_returning_it(self) -> None:
+    async def test_task_local_absolute_inspection_path_correlates_without_returning_it(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "agentbay" / "digest"
@@ -191,6 +267,96 @@ class ArtifactDownloadTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(artifacts[0]["validation_status"], "passed")
             self.assertNotIn(str(target.resolve()), str(artifacts[0]))
+
+    async def test_legacy_media_manifest_is_visible_then_replaced_by_canonical_event(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "media" / "artifacts" / "visual.png"
+            target.parent.mkdir(parents=True)
+            payload = b"\x89PNG\r\n\x1a\nfixture"
+            target.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            legacy = SimpleNamespace(
+                type="composition_tool_event",
+                payload={
+                    "success": True,
+                    "role_key": "image_creator",
+                    "data": {"artifacts": [{
+                        "artifact_id": "artifact-image",
+                        "kind": "image",
+                        "local_relative_path": "artifacts/visual.png",
+                        "mime_type": "image/png",
+                        "byte_size": len(payload),
+                        "sha256": digest,
+                    }]},
+                },
+            )
+            canonical = SimpleNamespace(
+                type="composition_media_artifact_recorded",
+                payload={
+                    "producer": "image_creator",
+                    "expected_artifact": "launch_visual.png",
+                    "artifact": {
+                        "artifact_id": "artifact-image",
+                        "kind": "image",
+                        "local_relative_path": "media/artifacts/visual.png",
+                        "mime_type": "image/png",
+                        "byte_size": len(payload),
+                        "sha256": digest,
+                        "model_id": "qwen-image",
+                        "width": 1792,
+                        "height": 1008,
+                    },
+                },
+            )
+            fake_society = Mock()
+            fake_society.list_events.return_value = [legacy, canonical]
+            fake_society.get_task_summary.return_value = {"id": "task-1"}
+            fake_society._composition_artifact_root.return_value = root
+
+            with patch.object(main, "society", fake_society):
+                artifacts = await main.task_artifacts("task-1")
+
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual(artifacts[0]["path"], "launch_visual.png")
+            self.assertEqual(artifacts[0]["model_id"], "qwen-image")
+            self.assertEqual((artifacts[0]["width"], artifacts[0]["height"]), (1792, 1008))
+
+    async def test_failed_legacy_generation_remains_visible_but_never_passes_validation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "media" / "artifacts" / "partial.png"
+            target.parent.mkdir(parents=True)
+            payload = b"\x89PNG\r\n\x1a\npartial"
+            target.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            media = SimpleNamespace(
+                type="composition_tool_event",
+                payload={
+                    "success": False,
+                    "data": {"artifact": {
+                        "artifact_id": "artifact-partial",
+                        "kind": "image",
+                        "local_relative_path": "artifacts/partial.png",
+                        "sha256": digest,
+                    }},
+                },
+            )
+            validation = SimpleNamespace(
+                type="local_independent_validation_reported",
+                payload={"passed": True, "inspected_artifact_refs": ["media/artifacts/partial.png"]},
+            )
+            fake_society = Mock()
+            fake_society.list_events.return_value = [media, validation]
+            fake_society.get_task_summary.return_value = {"id": "task-1"}
+            fake_society._composition_artifact_root.return_value = root
+
+            with patch.object(main, "society", fake_society):
+                artifacts = await main.task_artifacts("task-1")
+
+            self.assertEqual(artifacts[0]["status"], "available")
+            self.assertEqual(artifacts[0]["generation_status"], "failed")
+            self.assertEqual(artifacts[0]["validation_status"], "failed")
 
     async def test_ambiguous_inspected_basename_does_not_validate_multiple_exports(self) -> None:
         with TemporaryDirectory() as temp_dir:

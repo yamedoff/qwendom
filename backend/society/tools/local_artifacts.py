@@ -4,7 +4,7 @@ import hashlib
 import json
 import mimetypes
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 
 from agno.tools import Toolkit
@@ -12,10 +12,28 @@ from agno.tools import Toolkit
 from ..capability_registry import get_role_capabilities
 
 MAX_INSPECT_BYTES = 16_384
+MAX_HASH_BYTES = 32 * 1024 * 1024
 MAX_TEXT_CONTENT_CHARS = 4_000
 MAX_REPORT_ITEMS = 12
 MAX_REPORT_TEXT = 300
 _URL_PATTERN = re.compile(r"https?://\S+")
+_SAFE_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+
+def _safe_mime_type(path: Path, sample: bytes) -> str:
+    """Return a conservative MIME type that is safe to expose to an agent."""
+
+    guessed = mimetypes.guess_type(path.name)[0]
+    if guessed in _SAFE_IMAGE_MIME_TYPES:
+        if guessed != "image/png" or sample.startswith(b"\x89PNG\r\n\x1a\n"):
+            return guessed
+    return "application/octet-stream"
+
+
+def _is_safe_utf8_text(value: str) -> bool:
+    """Reject binary-looking UTF-8 so raw bytes never become model content."""
+
+    return "\x00" not in value and all(char.isprintable() or char in "\n\r\t" for char in value)
 
 
 def _bounded_text(value: Any, limit: int = MAX_REPORT_TEXT) -> str:
@@ -49,6 +67,28 @@ def _normalize_report_items(value: list[str] | dict[str, str] | str) -> list[str
     else:
         raw_items = list(value)
     return [_redact_text(_bounded_text(item)) for item in raw_items[:MAX_REPORT_ITEMS]]
+
+
+def _raw_artifact_refs(value: list[str] | dict[str, str] | str) -> list[str]:
+    """Extract reference values without turning mapping labels into fake paths."""
+
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            raw_items: list[Any] = [value]
+        else:
+            if isinstance(decoded, Mapping):
+                raw_items = list(decoded.values())
+            elif isinstance(decoded, list):
+                raw_items = decoded
+            else:
+                raw_items = [value]
+    elif isinstance(value, Mapping):
+        raw_items = list(value.values())
+    else:
+        raw_items = list(value)
+    return [str(item).strip() for item in raw_items[:MAX_REPORT_ITEMS] if str(item).strip()]
 
 
 class LocalArtifactTools(Toolkit):
@@ -104,21 +144,22 @@ class LocalArtifactTools(Toolkit):
         raw = artifact_ref.strip()
         candidate = Path(raw)
         joined = candidate if candidate.is_absolute() else (self._artifact_root / candidate)
+        try:
+            lexical_relative = joined.relative_to(self._artifact_root)
+        except ValueError as exc:
+            raise ValueError("Artifact path is outside the task artifact root") from exc
+        current = self._artifact_root
+        for part in lexical_relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError("Symlink artifact paths are not allowed")
         resolved = joined.resolve(strict=True)
         try:
             relative = resolved.relative_to(self._artifact_root)
         except ValueError as exc:
             raise ValueError("Artifact path resolves outside the task artifact root") from exc
-        current = self._artifact_root
-        for part in relative.parts:
-            current = current / part
-            if current.is_symlink():
-                raise ValueError("Symlink artifact paths are not allowed")
         if resolved.is_dir():
             raise ValueError("Artifact inspection only accepts files")
-        size_bytes = resolved.stat().st_size
-        if size_bytes > MAX_INSPECT_BYTES:
-            raise ValueError("Artifact exceeds the inspection size limit")
         safe_relative = relative.as_posix()
         return resolved, safe_relative
 
@@ -127,40 +168,67 @@ class LocalArtifactTools(Toolkit):
 
         try:
             resolved, safe_relative = self._resolve_candidate(artifact_ref)
-            raw_bytes = resolved.read_bytes()
-            sha256 = hashlib.sha256(raw_bytes).hexdigest()
-            mime_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+            size_bytes = resolved.stat().st_size
+            if size_bytes > MAX_HASH_BYTES:
+                raise ValueError("Artifact exceeds the safe inspection limit")
+            digest = hashlib.sha256()
+            sample = bytearray()
+            with resolved.open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    digest.update(chunk)
+                    if len(sample) < MAX_INSPECT_BYTES:
+                        sample.extend(chunk[: MAX_INSPECT_BYTES - len(sample)])
+            sha256 = digest.hexdigest()
+            sample_bytes = bytes(sample)
+            mime_type = _safe_mime_type(resolved, sample_bytes)
             text_content: str | None = None
-            try:
-                decoded = raw_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                decoded = None
-            if decoded is not None:
+            decoded = None
+            if size_bytes <= MAX_INSPECT_BYTES:
+                try:
+                    decoded = sample_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    decoded = None
+            if decoded is not None and _is_safe_utf8_text(decoded):
                 text_content = _redact_text(decoded[:MAX_TEXT_CONTENT_CHARS])
                 mime_type = "text/plain"
+            width: int | None = None
+            height: int | None = None
+            if mime_type == "image/png" and len(sample_bytes) >= 24:
+                width = int.from_bytes(sample_bytes[16:20], "big")
+                height = int.from_bytes(sample_bytes[20:24], "big")
             payload = {
                 "success": True,
                 "artifact_ref": safe_relative,
                 "safe_relative_path": safe_relative,
                 "sha256": sha256,
-                "size_bytes": len(raw_bytes),
+                "size_bytes": size_bytes,
                 "mime_type": mime_type,
                 "is_text": text_content is not None,
                 "content": text_content,
+                "width": width,
+                "height": height,
             }
-            self._emit("local_artifact_inspected", artifact_ref=safe_relative, sha256=sha256, size_bytes=len(raw_bytes))
+            self._emit(
+                "local_artifact_inspected",
+                artifact_ref=safe_relative,
+                sha256=sha256,
+                size_bytes=size_bytes,
+                mime_type=mime_type,
+                width=width,
+                height=height,
+            )
             return payload
         except Exception as exc:
             self._emit(
                 "local_artifact_inspection_failed",
-                artifact_ref=_redact_text(_bounded_text(artifact_ref)),
-                error_message=_redact_text(_bounded_text(exc)),
+                artifact_ref="invalid-artifact-ref",
+                error_message="Artifact inspection failed",
             )
             return {
                 "success": False,
-                "artifact_ref": _redact_text(_bounded_text(artifact_ref)),
+                "artifact_ref": "invalid-artifact-ref",
                 "error_code": "artifact_inspection_failed",
-                "error_message": _redact_text(_bounded_text(exc)),
+                "error_message": "Artifact inspection failed",
             }
 
     def report_independent_validation(
@@ -185,7 +253,23 @@ class LocalArtifactTools(Toolkit):
             if item not in normalized_failures
         )
         normalized_failures = normalized_failures[:MAX_REPORT_ITEMS]
-        normalized_refs = _normalize_report_items(inspected_artifact_refs or [])
+        normalized_refs: list[str] = []
+        for raw_ref in _raw_artifact_refs(inspected_artifact_refs or []):
+            candidate = Path(raw_ref)
+            if candidate.is_absolute():
+                try:
+                    safe_ref = candidate.resolve().relative_to(self._artifact_root).as_posix()
+                except (OSError, ValueError):
+                    continue
+            else:
+                portable = PurePosixPath(raw_ref.replace("\\", "/"))
+                if portable.is_absolute() or not portable.parts or any(
+                    part in {"", ".", ".."} or ":" in part for part in portable.parts
+                ):
+                    continue
+                safe_ref = portable.as_posix()
+            if safe_ref not in normalized_refs:
+                normalized_refs.append(safe_ref)
         report = {
             "passed": bool(passed) and not normalized_failures,
             "checks": normalized_checks,

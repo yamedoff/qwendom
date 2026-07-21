@@ -510,6 +510,81 @@ class OrchestratorTeamCompositionIntegrationTests(unittest.IsolatedAsyncioTestCa
         self.assertIn('"builder"', prompts[1])
         self.assertIn('"test_engineer"', prompts[1])
 
+    async def test_fixed_selection_gets_second_correction_for_direct_validator_coverage(self) -> None:
+        """A newly exposed artifact-validation blocker receives one final bounded correction."""
+
+        orch = _make_orchestrator(settings=_settings(TEAM_COMPOSITION_STRATEGY="fixed_specialists"))
+        task, team = _task_and_team(orch)
+
+        class FixedRuntime(_FakeRuntime):
+            def available_tool_ids(self) -> RuntimeAvailability:
+                from society.capability_registry import list_fixed_specialist_templates
+
+                return RuntimeAvailability(tool_ids=sorted({
+                    tool_id
+                    for template in list_fixed_specialist_templates().values()
+                    for tool_id in template.tool_ids
+                }))
+
+        prompts: list[str] = []
+
+        def selection(*, validator_owns: bool, direct_core_dependency: bool) -> SelectSpecialistsCall:
+            return SelectSpecialistsCall(
+                selection_rationale="Build the product and tests, then validate both exports.",
+                assignments=[
+                    SpecialistAssignmentSelection(
+                        assignment_id="core",
+                        template_id="builder",
+                        objective="Implement the product file.",
+                        depends_on=[],
+                        owned_artifacts=["src/calc.py"],
+                        acceptance_requirements=["unit_tests"],
+                    ),
+                    SpecialistAssignmentSelection(
+                        assignment_id="tests",
+                        template_id="builder",
+                        objective="Implement the test file.",
+                        depends_on=["core"],
+                        owned_artifacts=["tests/test_calc.py"],
+                        acceptance_requirements=["unit_tests"],
+                    ),
+                    SpecialistAssignmentSelection(
+                        assignment_id="validate",
+                        template_id="test_engineer",
+                        objective="Validate every exported artifact.",
+                        depends_on=(["core", "tests"] if direct_core_dependency else ["tests"]),
+                        owned_artifacts=(["reports/validation.json"] if validator_owns else []),
+                        acceptance_requirements=["unit_tests"],
+                    ),
+                ],
+            )
+
+        async def governance_call(_task, _actor, _tool_func, tool_name, _schema, prompt, _extra=None):
+            if tool_name == "list_specialists":
+                return ListSpecialistsResult.model_validate({
+                    "specialists": orch._state(task.id)["fixed_specialist_catalog"]
+                })
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return selection(validator_owns=True, direct_core_dependency=False)
+            if len(prompts) == 2:
+                return selection(validator_owns=False, direct_core_dependency=False)
+            return selection(validator_owns=False, direct_core_dependency=True)
+
+        orch._run_governance_tool = AsyncMock(side_effect=governance_call)
+        runtime = FixedRuntime()
+        context = runtime.build_composition_context(task.id, task.prompt, ["unit_tests"])
+
+        result = await orch._select_fixed_specialist_plan(task, team, context, runtime)
+
+        self.assertEqual(result.attempt_count, 3)
+        self.assertTrue(result.recomposed)
+        self.assertEqual(result.plan.work_graph[-1].depends_on, ["core", "tests"])
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("transitive dependency is not sufficient", prompts[0])
+        self.assertIn("specialist_cannot_produce_artifacts", prompts[1])
+        self.assertIn("artifact_without_independent_validation", prompts[2])
+
     async def test_disabled_path_preserves_legacy_delegation_seam(self) -> None:
         orch = _make_orchestrator(settings=_settings(TEAM_COMPOSITION_EXECUTION_ENABLED=False))
         task, team = _task_and_team(orch)

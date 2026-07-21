@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Protocol, TypedDict
 from uuid import uuid4
 
 import httpx
@@ -72,6 +72,32 @@ VIDEO_RUNTIME_TOOL_IDS: tuple[str, ...] = (
 LOCAL_RUNTIME_TOOL_IDS: tuple[str, ...] = ("context7_lookup", "execute_notes_demo", "risk_assessment")
 LOCAL_ARTIFACT_TOOL_IDS: tuple[str, ...] = ("inspect_artifact", "report_independent_validation")
 PROVIDER_TOOL_IDS: frozenset[str] = frozenset(AGENTBAY_RUNTIME_TOOL_IDS + IMAGE_RUNTIME_TOOL_IDS + VIDEO_RUNTIME_TOOL_IDS)
+
+
+class MediaArtifactEnvelope(TypedDict):
+    """Canonical, task-relative evidence passed from a media producer to validation.
+
+    The envelope deliberately separates immutable, machine-verifiable file
+    facts from semantic acceptance. The default runtime has no vision model
+    wired into this boundary, so image subject/layout/text criteria must remain
+    pending human review instead of being represented as a successful check.
+    """
+
+    artifact_id: str
+    artifact_ref: str
+    task_relative_path: str | None
+    local_relative_path: str | None
+    kind: str
+    mime_type: str | None
+    byte_size: int | None
+    sha256: str | None
+    model_id: str | None
+    width: int | None
+    height: int | None
+    format: str | None
+    published: bool | None
+    publication_state: str
+    provenance_complete: bool
 
 
 class AvailabilityBlocker(BaseModel):
@@ -584,10 +610,16 @@ class AgnoAssignmentExecutor:
     def _verified_generated_media_artifacts(
         self,
         internal_trace: Sequence[Mapping[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Resolve generated-media trace IDs to durable, provenance-complete manifests."""
+        *,
+        expected_image_dimensions: tuple[int, int] | None = None,
+    ) -> list[MediaArtifactEnvelope]:
+        """Resolve generated media to canonical task-local artifact envelopes.
 
-        verified: list[dict[str, Any]] = []
+        Downstream specialists must receive a resolvable path and immutable
+        provenance, not only the provider-facing artifact ID.
+        """
+
+        verified: list[MediaArtifactEnvelope] = []
         for artifact_id in _event_backed_media_artifact_ids(internal_trace):
             try:
                 manifest = self._media_store.load_artifact_manifest(artifact_id)
@@ -596,8 +628,103 @@ class AgnoAssignmentExecutor:
             kind = manifest.get("kind")
             if kind not in {"image", "video"} or manifest.get("provenance_complete") is not True:
                 continue
-            verified.append({"artifact_id": artifact_id, "kind": kind})
+            if expected_image_dimensions is not None and kind == "image":
+                observed_dimensions = (manifest.get("width"), manifest.get("height"))
+                if observed_dimensions != expected_image_dimensions:
+                    continue
+            store_relative = manifest.get("local_relative_path")
+            task_relative = None
+            if isinstance(store_relative, str) and store_relative.strip():
+                normalized = PurePosixPath(store_relative.replace("\\", "/"))
+                if not normalized.is_absolute() and ".." not in normalized.parts:
+                    task_relative = (PurePosixPath("media") / normalized).as_posix()
+            published = manifest.get("published")
+            envelope: MediaArtifactEnvelope = {
+                "artifact_id": artifact_id,
+                "artifact_ref": task_relative or artifact_id,
+                "task_relative_path": task_relative,
+                "local_relative_path": task_relative,
+                "kind": kind,
+                "mime_type": manifest.get("mime_type"),
+                "byte_size": manifest.get("byte_size"),
+                "sha256": manifest.get("sha256"),
+                "model_id": manifest.get("model_id"),
+                "width": manifest.get("width"),
+                "height": manifest.get("height"),
+                "format": manifest.get("format"),
+                "published": published if isinstance(published, bool) else None,
+                "publication_state": "published" if published is True else "unpublished" if published is False else "unknown",
+                "provenance_complete": True,
+            }
+            verified.append(envelope)
         return verified
+
+    @staticmethod
+    def _negative_visual_constraints(assignment: TeamAssignment, user_request: str) -> list[str]:
+        """Extract stated prohibitions for a self-contained image correction prompt.
+
+        The complete objective and request are also supplied verbatim. This
+        compact list makes prohibitions such as "no text" impossible for the
+        correction agent to overlook without inventing extra constraints.
+        """
+
+        source = f"{assignment.objective}\n{user_request}"
+        matches = re.findall(
+            r"\b(?:no|without|avoid|exclude|do not|don't|never)\b[^\n.;]*",
+            source,
+            flags=re.IGNORECASE,
+        )
+        return _merge_unique_strings(matches, limit=_MAX_OUTPUT_ITEMS)
+
+    @staticmethod
+    def _media_semantic_review(assignment: TeamAssignment) -> dict[str, Any]:
+        """Describe the honest semantic-review boundary for generated media."""
+
+        return {
+            "status": "human_review_required",
+            "criteria": _merge_unique_strings(assignment.acceptance_checks, limit=_MAX_OUTPUT_ITEMS),
+            "reason": "No vision-capable semantic validator is wired into this runtime; file metadata cannot prove image subject, layout, or text constraints.",
+        }
+
+    @staticmethod
+    def _dependency_requires_media_semantic_review(
+        direct_dependency_outputs: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        """Detect unresolved media semantics carried forward by a producer."""
+
+        for output in direct_dependency_outputs.values():
+            artifacts = output.get("media_artifacts") if isinstance(output, Mapping) else None
+            if not isinstance(artifacts, list):
+                continue
+            for artifact in artifacts:
+                validation = artifact.get("semantic_validation") if isinstance(artifact, Mapping) else None
+                if isinstance(validation, Mapping) and validation.get("status") == "human_review_required":
+                    return True
+        return False
+
+    @staticmethod
+    def _requested_image_dimensions(
+        assignment: TeamAssignment,
+        user_request: str,
+    ) -> tuple[int, int] | None:
+        """Derive deterministic generation dimensions from an explicit aspect ratio."""
+
+        text = f"{assignment.objective}\n{user_request}"
+        match = re.search(r"\b(\d{1,2})\s*[:x×]\s*(\d{1,2})\b", text, flags=re.IGNORECASE)
+        if match is None:
+            return None
+        horizontal = max(1, int(match.group(1)))
+        vertical = max(1, int(match.group(2)))
+        if horizontal == vertical:
+            return 1024, 1024
+        long_edge = 1792
+        if horizontal > vertical:
+            width = long_edge
+            height = max(512, round((long_edge * vertical / horizontal) / 16) * 16)
+        else:
+            height = long_edge
+            width = max(512, round((long_edge * horizontal / vertical) / 16) * 16)
+        return width, height
 
     @staticmethod
     def _missing_required_tool_evidence(
@@ -933,6 +1060,7 @@ class AgnoAssignmentExecutor:
         tools: list[Any] = []
         warnings: list[str] = []
         agentbay_toolkit: Any | None = None
+        image_toolkit: Any | None = None
         media_client: httpx.Client | None = None
         tool_names: set[str] = set()
         internal_tool_trace: list[dict[str, Any]] = []
@@ -1022,19 +1150,19 @@ class AgnoAssignmentExecutor:
                                 arguments: Mapping[str, Any] | None,
                                 timeout_seconds: int,
                             ) -> dict[str, Any]:
-                                """Run the validator's single combined sandbox check."""
+                                """Run one of the validator's bounded independent checks."""
 
                                 nonlocal sandbox_execution_attempts, sandbox_execution_successes
-                                if sandbox_execution_successes >= 1 or sandbox_execution_attempts >= 3:
+                                if sandbox_execution_successes >= 2 or sandbox_execution_attempts >= 4:
                                     toolkit_event_sink({
                                         "event_type": "composition_sandbox_execution_limit_reached",
                                         "tool_id": "execute_command",
-                                        "limit": 1,
+                                        "limit": 2,
                                     })
                                     return {
                                         "success": False,
                                         "error_code": "sandbox_execution_limit_reached",
-                                        "error_message": "Validator sandbox execution limit reached; report existing evidence.",
+                                        "error_message": "Validator sandbox execution limit reached after two successful checks; report existing evidence.",
                                     }
                                 runtime_handle = cached_execution_handle()
                                 if runtime_handle is None:
@@ -1055,19 +1183,19 @@ class AgnoAssignmentExecutor:
                             tool = execute_command
                         elif assignment.agent_template_id == "test_engineer" and tool_id == "run_code":
                             async def run_code(handle: str, language: str, code: str, timeout_seconds: int) -> dict[str, Any]:
-                                """Run the validator's single combined sandbox check."""
+                                """Run one of the validator's bounded independent checks."""
 
                                 nonlocal sandbox_execution_attempts, sandbox_execution_successes
-                                if sandbox_execution_successes >= 1 or sandbox_execution_attempts >= 3:
+                                if sandbox_execution_successes >= 2 or sandbox_execution_attempts >= 4:
                                     toolkit_event_sink({
                                         "event_type": "composition_sandbox_execution_limit_reached",
                                         "tool_id": "run_code",
-                                        "limit": 1,
+                                        "limit": 2,
                                     })
                                     return {
                                         "success": False,
                                         "error_code": "sandbox_execution_limit_reached",
-                                        "error_message": "Validator sandbox execution limit reached; report existing evidence.",
+                                        "error_message": "Validator sandbox execution limit reached after two successful checks; report existing evidence.",
                                     }
                                 runtime_handle = cached_execution_handle()
                                 if runtime_handle is None:
@@ -1182,29 +1310,97 @@ class AgnoAssignmentExecutor:
                     for path in assignment.expected_artifacts
                 )
             )
-            if needs_generated_image and not self._verified_generated_media_artifacts(internal_tool_trace):
-                # An image specialist cannot complete from prose alone. Give the
-                # same bounded agent one explicit chance to invoke its real
-                # media tools before the mandatory-evidence gate rejects it.
+            requested_dimensions = (
+                self._requested_image_dimensions(assignment, self._current_user_request)
+                if needs_generated_image
+                else None
+            )
+            if needs_generated_image and not self._verified_generated_media_artifacts(
+                internal_tool_trace,
+                expected_image_dimensions=requested_dimensions,
+            ):
+                # Generation is a mandatory delivery operation, just like a
+                # Builder's final artifact export. If the model returned prose
+                # without using its granted tool, enforce the real Qwen Image
+                # call at the runtime boundary rather than spending another
+                # nondeterministic model turn asking it to do the same thing.
                 await _emit_event(
                     self._event_sink,
                     "composition_media_correction_requested",
-                    {"assignment_id": assignment.id, "node_id": node.id},
+                    {
+                        "assignment_id": assignment.id,
+                        "node_id": node.id,
+                        "expected_dimensions": requested_dimensions,
+                        "reason": "no canonical generated image matched the recorded request",
+                    },
                 )
-                correction_response = await agent.arun(
-                    "Your previous turn did not produce a verified image artifact. "
-                    "Call generate_images now with the assignment's visual direction, then call inspect_image "
-                    "and publish_image for the returned artifact ID. Do not return prose until those tool calls finish."
-                )
-                result = _normalize_agent_response(correction_response)
+                requested_width, requested_height = requested_dimensions or (1024, 1024)
+                negative_constraints = self._negative_visual_constraints(assignment, self._current_user_request)
+                if image_toolkit is not None:
+                    generation_result = await _maybe_await(
+                        image_toolkit.generate_images(
+                            prompt=(
+                                f"{assignment.objective}\n\n"
+                                f"Original mission and constraints:\n{self._current_user_request}"
+                            ),
+                            negative_prompt="; ".join(negative_constraints),
+                            width=requested_width,
+                            height=requested_height,
+                            count=1,
+                        )
+                    )
+                    generation_data = (
+                        generation_result.get("data")
+                        if isinstance(generation_result, Mapping)
+                        else None
+                    )
+                    generated_ids = (
+                        generation_data.get("artifact_ids")
+                        if isinstance(generation_data, Mapping)
+                        else None
+                    )
+                    if isinstance(generated_ids, list):
+                        for artifact_id in generated_ids[:1]:
+                            if isinstance(artifact_id, str) and artifact_id:
+                                await _maybe_await(
+                                    image_toolkit.publish_image(
+                                        artifact_id,
+                                        "Publish the completed assignment artifact for independent review.",
+                                    )
+                                )
                 await _emit_event(
                     self._event_sink,
                     "composition_media_correction_completed",
                     {
                         "assignment_id": assignment.id,
                         "node_id": node.id,
-                        "generated": bool(self._verified_generated_media_artifacts(internal_tool_trace)),
+                        "expected_dimensions": requested_dimensions,
+                        "generated": bool(
+                            self._verified_generated_media_artifacts(
+                                internal_tool_trace,
+                                expected_image_dimensions=requested_dimensions,
+                            )
+                        ),
                     },
+                )
+            if needs_generated_image and not self._verified_generated_media_artifacts(
+                internal_tool_trace,
+                expected_image_dimensions=requested_dimensions,
+            ):
+                await _emit_event(
+                    self._event_sink,
+                    "composition_media_validation_failed",
+                    {
+                        "assignment_id": assignment.id,
+                        "node_id": node.id,
+                        "expected_dimensions": requested_dimensions,
+                        "reason": "No generated image had a canonical task-relative envelope with the requested recorded dimensions.",
+                    },
+                )
+                raise NodeExecutionError(
+                    "validation",
+                    "generated_media_contract_failed",
+                    "Generated image evidence did not satisfy the required recorded dimensions and canonical media contract.",
                 )
             if (
                 assignment.template_version is not None
@@ -1270,14 +1466,34 @@ class AgnoAssignmentExecutor:
                 )
             if warnings:
                 result["warnings"] = warnings
-            failed_required = self._failed_required_tool_outcomes(assignment, granted_tool_ids, internal_tool_trace)
+            evidence_tool_ids = list(granted_tool_ids)
+            media_only_validation = (
+                assignment.agent_template_id == "test_engineer"
+                and not dependency_workspace_overlays
+                and any(
+                    isinstance(output, Mapping)
+                    and isinstance(output.get("media_artifacts"), list)
+                    and bool(output.get("media_artifacts"))
+                    for output in direct_dependency_outputs.values()
+                )
+            )
+            if media_only_validation:
+                # Metadata inspection reads the durable local media envelope;
+                # starting an empty AgentBay workspace adds no evidence. Keep
+                # AgentBay mandatory for repository/code validators, but do not
+                # fail a successful media validator for omitting irrelevant
+                # sandbox lifecycle calls.
+                evidence_tool_ids = [
+                    tool_id for tool_id in evidence_tool_ids if tool_id not in AGENTBAY_RUNTIME_TOOL_IDS
+                ]
+            failed_required = self._failed_required_tool_outcomes(assignment, evidence_tool_ids, internal_tool_trace)
             if failed_required:
                 raise NodeExecutionError(
                     "capability",
                     "mandatory_tool_reported_failure",
                     f"Mandatory tool reported failure: {sorted(set(failed_required))}",
                 )
-            missing_required = self._missing_required_tool_evidence(assignment, granted_tool_ids, internal_tool_trace)
+            missing_required = self._missing_required_tool_evidence(assignment, evidence_tool_ids, internal_tool_trace)
             if missing_required:
                 raise NodeExecutionError(
                     "capability",
@@ -1285,7 +1501,10 @@ class AgnoAssignmentExecutor:
                     f"Mandatory tool evidence missing: {sorted(set(missing_required))}",
                 )
             merged_result = _merge_event_backed_output(assignment, result, internal_tool_trace)
-            verified_media_artifacts = self._verified_generated_media_artifacts(internal_tool_trace)
+            verified_media_artifacts = self._verified_generated_media_artifacts(
+                internal_tool_trace,
+                expected_image_dimensions=requested_dimensions,
+            )
             media_artifacts_by_expected_path: dict[str, dict[str, Any]] = {}
             for expected_path, media_artifact in zip(
                 (
@@ -1301,17 +1520,92 @@ class AgnoAssignmentExecutor:
                 # Preserve the produced-media reference for projections while
                 # keeping workspace_exports exclusively for AgentBay files.
                 merged_result["media_artifacts"] = [
-                    {"expected_artifact": path, **artifact}
+                    {
+                        "expected_artifact": path,
+                        **artifact,
+                        "semantic_validation": self._media_semantic_review(assignment),
+                    }
                     for path, artifact in media_artifacts_by_expected_path.items()
                 ]
+                for path, artifact in media_artifacts_by_expected_path.items():
+                    await _emit_event(
+                        self._event_sink,
+                        "composition_media_artifact_recorded",
+                        {
+                            "assignment_id": assignment.id,
+                            "node_id": node.id,
+                            "producer": assignment.agent_template_id,
+                            "expected_artifact": path,
+                            "artifact": {
+                                **artifact,
+                                "semantic_validation": self._media_semantic_review(assignment),
+                            },
+                        },
+                    )
+                    await _emit_event(
+                        self._event_sink,
+                        "composition_media_semantic_review_required",
+                        {
+                            "assignment_id": assignment.id,
+                            "node_id": node.id,
+                            "expected_artifact": path,
+                            "semantic_validation": self._media_semantic_review(assignment),
+                        },
+                    )
                 merged_result["artifact_refs"] = _merge_unique_strings(
                     merged_result.get("artifact_refs") if isinstance(merged_result.get("artifact_refs"), list) else [],
-                    [artifact["artifact_id"] for artifact in media_artifacts_by_expected_path.values()],
+                    [
+                        str(artifact.get("artifact_ref") or artifact["artifact_id"])
+                        for artifact in media_artifacts_by_expected_path.values()
+                    ],
+                    limit=_MAX_OUTPUT_ITEMS,
+                )
+            if assignment.agent_template_id == "test_engineer" and self._dependency_requires_media_semantic_review(direct_dependency_outputs):
+                evidence = {
+                    "passed": bool(merged_result.get("passed")),
+                    "checks": merged_result.get("checks", []),
+                    "failures": merged_result.get("failures", []),
+                    "inspected_artifact_refs": merged_result.get("inspected_artifact_refs", []),
+                    "semantic_validation": "human_review_required",
+                }
+                await _emit_event(
+                    self._event_sink,
+                    "composition_validator_finding",
+                    {
+                        "assignment_id": assignment.id,
+                        "node_id": node.id,
+                        "finding": "Generated-media semantic acceptance remains unverified without a vision-capable validator.",
+                        "evidence": evidence,
+                    },
+                )
+                # A missing vision validator is an explicit review boundary, not
+                # a failed technical validation. Keep the warning in both the
+                # durable event and node output so downstream acceptance logic
+                # cannot mistake metadata checks for semantic approval, while
+                # allowing the generated deliverable to reach the jury.
+                merged_result["semantic_validation"] = "human_review_required"
+                merged_result["warnings"] = _merge_unique_strings(
+                    merged_result.get("warnings") if isinstance(merged_result.get("warnings"), list) else [],
+                    ["Generated-media subject, layout, and text criteria require human review."],
                     limit=_MAX_OUTPUT_ITEMS,
                 )
             if assignment.agent_template_id == "test_engineer" and merged_result.get("passed") is not True:
                 failures = merged_result.get("failures")
                 failure_summary = failures if isinstance(failures, list) else []
+                await _emit_event(
+                    self._event_sink,
+                    "composition_validator_finding",
+                    {
+                        "assignment_id": assignment.id,
+                        "node_id": node.id,
+                        "finding": "Independent validation did not pass dependency artifacts.",
+                        "evidence": {
+                            "checks": merged_result.get("checks", []),
+                            "failures": failure_summary,
+                            "inspected_artifact_refs": merged_result.get("inspected_artifact_refs", []),
+                        },
+                    },
+                )
                 raise NodeExecutionError(
                     "validation",
                     "independent_validation_failed",
@@ -1410,16 +1704,47 @@ class AgnoAssignmentExecutor:
         direct_dependency_outputs: Mapping[str, Mapping[str, Any]],
         user_request: str,
     ) -> str:
+        dependency_paths: list[str] = []
+        for output in direct_dependency_outputs.values():
+            if not isinstance(output, Mapping):
+                continue
+            refs = output.get("artifact_refs")
+            if isinstance(refs, list):
+                dependency_paths.extend(str(ref) for ref in refs if isinstance(ref, str))
+            exports = output.get("workspace_exports")
+            if isinstance(exports, list):
+                dependency_paths.extend(
+                    str(item.get("workspace_relative_path") or item.get("path"))
+                    for item in exports
+                    if isinstance(item, Mapping) and (item.get("workspace_relative_path") or item.get("path"))
+                )
+        dependency_paths = _merge_unique_strings(
+            [path.replace("\\", "/").removeprefix("/workspace/").lstrip("/") for path in dependency_paths],
+            limit=_MAX_OUTPUT_ITEMS,
+        )
+        dependency_test_targets = [
+            path
+            for path in dependency_paths
+            if path.startswith("repo/") and Path(path).name.startswith("test_") and Path(path).suffix == ".py"
+        ]
         verified_skills = "\n\n".join(
             _bounded_text(content, _MAX_PROMPT_TEXT) for content in skill_instructions
         )
-        repository_check = (
+        if assignment.agent_template_id == "test_engineer" and dependency_test_targets:
+            repository_check = (
+                "This validator has repository dependencies. Call execute_command once with command_id `python_compile`, "
+                "arguments {\"target\": \"/workspace/repo\"}, then call execute_command once with command_id "
+                f"`pytest_target`, arguments {{\"target\": \"/workspace/{dependency_test_targets[0]}\"}}. "
+                "Both real execution events are mandatory. Do not call execute_command or run_code again after both succeed.\n"
+            )
+        else:
+            repository_check = (
             "Before returning, call execute_command once with command_id `python_compile`, "
             "arguments {\"target\": \"/workspace/repo\"}, and a bounded timeout; a successful real execution event is mandatory. "
             "After it succeeds, do not call execute_command or run_code again for this repository assignment.\n"
             if any(str(path).replace("\\", "/").startswith("repo/") for path in assignment.expected_artifacts)
             else "A successful real sandbox check or required browser render is mandatory before returning.\n"
-        )
+            )
         return (
             "Complete the assignment using only the granted tools.\n"
             "Return exactly one JSON object with no markdown or prose outside the JSON.\n"
@@ -1448,12 +1773,16 @@ class AgnoAssignmentExecutor:
             "four fields plus `passed` in the final JSON. The tool also accepts `failed_checks` as an alias for `failures`.\n"
             "A validator must judge only the durable artifacts present in direct dependency outputs. Do not require or fail "
             "on runtime-owned cleanup markers or other files that are not among those dependency exports.\n"
+            "For generated-media envelopes, metadata can verify only bytes, hashes, MIME, dimensions, provenance, and publication state. "
+            "It cannot prove visual subject, layout, text, or other semantic acceptance criteria. When a dependency marks "
+            "semantic_validation as human_review_required, report that blocker precisely and do not mark semantic criteria passed.\n"
             "A validator must exercise the fixture's original public entry points and reject interface removal or replacement. "
             "It must also reject machine-readable deliverables that omit any stated artifact semantic, bury required facts "
             "only in prose, or cite commands that were not executed.\n"
-            "A validator may complete exactly one successful combined sandbox execution call, with no more than three bounded attempts. "
-            "Combine all behavioral, report-schema, rollback, and adversarial assertions into one run_code call whenever "
-            "possible, correct a rejected call once, then report the evidence without further exploration.\n"
+            "A validator may complete at most two successful sandbox execution calls, with no more than four bounded attempts. "
+            "Use the two calls only when the acceptance contract explicitly requires distinct compile and test evidence; otherwise "
+            "combine behavioral, report-schema, rollback, and adversarial assertions into one call. Correct a rejected call once, "
+            "then report the evidence without further exploration.\n"
             "For validator run_code, use pure Python built-ins and literal content already returned by inspect_artifact. Do not "
             "import modules, access the filesystem, invoke dynamic execution, or use restricted process/environment capabilities. "
             "Do not call pytest_target unless inspected fixture evidence proves a test target exists.\n"

@@ -434,7 +434,60 @@ def test_default_command_templates_use_linux_python3(tmp_path):
     result = tools.execute_command(handle, "python_compile", {"target": "/workspace/repo"}, 5)
 
     assert result["success"] is True
-    assert client.session.command.calls[0]["command"] == "python3 -m compileall /workspace/repo"
+    assert client.session.command.calls[0]["command"] == "env PYTHONPATH=/workspace python3 -m compileall /workspace/repo"
+
+
+@pytest.mark.parametrize(
+    ("command_id", "relative_target", "expected_command"),
+    [
+        (
+            "pytest_target",
+            "repo/test_payment_retry.py",
+            "env PYTHONPATH=/workspace python3 -m pytest /workspace/repo/test_payment_retry.py -q",
+        ),
+        (
+            "python_compile",
+            "repo/payment_retry.py",
+            "env PYTHONPATH=/workspace python3 -m compileall /workspace/repo/payment_retry.py",
+        ),
+    ],
+)
+def test_default_command_templates_canonicalize_workspace_targets(
+    tmp_path, command_id, relative_target, expected_command
+):
+    tools, client, _ = make_tools(tmp_path)
+    handle = start_handle(tools)
+
+    relative_result = tools.execute_command(handle, command_id, {"target": relative_target}, 5)
+    absolute_result = tools.execute_command(handle, command_id, {"target": f"/workspace/{relative_target}"}, 5)
+
+    assert relative_result["success"] is True
+    assert absolute_result["success"] is True
+    assert [call["command"] for call in client.session.command.calls] == [expected_command, expected_command]
+
+
+@pytest.mark.parametrize(
+    ("target", "contract_message"),
+    [
+        ("../bad.py", "non-traversing"),
+        ("/workspace/repo/../bad.py", "non-traversing"),
+        ("/tmp/bad.py", "beneath /workspace"),
+        ("/workspace-escape/bad.py", "beneath /workspace"),
+        ("repo/test.py;id", "unsupported path characters"),
+        ("repo/-q", "option-like"),
+        ("C:\\workspace\\repo\\test.py", "relative path"),
+    ],
+)
+def test_default_command_templates_reject_unsafe_workspace_targets(tmp_path, target, contract_message):
+    tools, client, _ = make_tools(tmp_path)
+    handle = start_handle(tools)
+
+    result = tools.execute_command(handle, "pytest_target", {"target": target}, 5)
+
+    assert result["success"] is False
+    assert result["error_code"] == "agentbay_command_rejected"
+    assert contract_message in result["error_message"]
+    assert client.session.command.calls == []
 
 
 def test_dependency_export_overlays_original_workspace_before_downstream_execution(tmp_path):

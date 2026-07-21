@@ -15,9 +15,16 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from config import Settings
-from society.tools.image_generation import IMAGE_MODEL_ID, ImageGenerationTools
+from society.tools.image_generation import (
+    DEFAULT_IMAGE_REQUEST_MAX_ATTEMPTS,
+    DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
+    IMAGE_MODEL_ID,
+    ImageGenerationTools,
+)
 from society.tools.media_store import (
     DEFAULT_MAX_DOWNLOAD_BYTES,
+    DEFAULT_DOWNLOAD_MAX_ATTEMPTS,
+    DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     ARTIFACT_ID_PATTERN,
     JOB_ID_PATTERN,
     MediaArtifactStore,
@@ -70,12 +77,14 @@ def make_store(
     clock: Clock,
     max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
     directory_fsync: Any | None = None,
+    **overrides: Any,
 ) -> MediaArtifactStore:
     return MediaArtifactStore(
         tmp_path / "media-store",
         clock=clock.now,
         max_download_bytes=max_download_bytes,
         directory_fsync=directory_fsync,
+        **overrides,
     )
 
 
@@ -311,6 +320,166 @@ def test_provider_media_url_allows_official_hosts_and_rejects_redirects(tmp_path
     assert calls.count("https://dashscope-result-1.aliyuncs.com/redirect.png") == 1
 
 
+def test_media_download_timeout_retries_then_commits_one_real_artifact(tmp_path):
+    clock = Clock(datetime(2026, 7, 14, tzinfo=UTC))
+    signed_url = "https://dashscope-result-1.aliyuncs.com/image.png?signature=jury-secret"
+    get_timeouts: list[dict[str, float]] = []
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        get_timeouts.append(request.extensions["timeout"])
+        if len(get_timeouts) == 1:
+            raise httpx.ConnectTimeout(f"connection failed for {signed_url}", request=request)
+        return httpx.Response(200, headers={"content-type": "image/png"}, content=b"verified-real-bytes")
+
+    store = make_store(
+        tmp_path,
+        clock,
+        download_timeout_seconds=147.0,
+        download_retry_delay_seconds=0.25,
+        sleeper=sleeps.append,
+    )
+    downloaded = store.save_downloaded_artifact(
+        kind="image",
+        model_id=IMAGE_MODEL_ID,
+        prompt="jury image",
+        negative_prompt="watermark",
+        request_id="req-download-retry",
+        latency_ms=10,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        download_url=signed_url,
+        usage={"width": 1792, "height": 1008},
+        cost=None,
+        mime_prefix="image/",
+        width=1792,
+        height=1008,
+    )
+
+    assert len(get_timeouts) == DEFAULT_DOWNLOAD_MAX_ATTEMPTS
+    assert all(timeout["read"] == 147.0 for timeout in get_timeouts)
+    assert sleeps == [0.25]
+    assert downloaded.manifest["byte_size"] == len(b"verified-real-bytes")
+    assert downloaded.manifest["sha256"]
+    assert downloaded.manifest["width"] == 1792
+    assert downloaded.manifest["height"] == 1008
+    assert len(list((store.root_dir / "manifests").glob("*.json"))) == 1
+    assert not list(store.root_dir.rglob("*.part"))
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 503])
+def test_media_download_transient_status_retries_once(status_code, tmp_path):
+    clock = Clock(datetime(2026, 7, 14, tzinfo=UTC))
+    get_count = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        get_count += 1
+        if get_count == 1:
+            return httpx.Response(status_code, content=b"transient")
+        return httpx.Response(200, headers={"content-type": "image/png"}, content=b"image")
+
+    store = make_store(tmp_path, clock, sleeper=sleeps.append)
+    downloaded = store.save_downloaded_artifact(
+        kind="image",
+        model_id=IMAGE_MODEL_ID,
+        prompt="prompt",
+        negative_prompt="",
+        request_id="req-transient",
+        latency_ms=1,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        download_url=IMAGE_URL_1,
+        usage={},
+        cost=None,
+        mime_prefix="image/",
+    )
+
+    assert downloaded.manifest["byte_size"] == len(b"image")
+    assert get_count == 2
+    assert sleeps == [1.0]
+    assert len(list((store.root_dir / "manifests").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+def test_media_download_permanent_status_is_not_retried_or_leaked(status_code, tmp_path):
+    clock = Clock(datetime(2026, 7, 14, tzinfo=UTC))
+    signed_url = "https://dashscope-result-1.aliyuncs.com/image.png?signature=never-leak"
+    get_count = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        get_count += 1
+        return httpx.Response(status_code, content=b"permanent")
+
+    store = make_store(tmp_path, clock, sleeper=sleeps.append)
+    with pytest.raises(ValueError) as raised:
+        store.save_downloaded_artifact(
+            kind="image",
+            model_id=IMAGE_MODEL_ID,
+            prompt="prompt",
+            negative_prompt="",
+            request_id="req-permanent",
+            latency_ms=1,
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+            download_url=signed_url,
+            usage={},
+            cost=None,
+            mime_prefix="image/",
+        )
+
+    assert str(status_code) in str(raised.value)
+    assert "never-leak" not in str(raised.value)
+    assert get_count == 1
+    assert sleeps == []
+    assert not list(store.root_dir.rglob("*.part"))
+    assert not list((store.root_dir / "manifests").glob("*.json"))
+
+
+def test_media_download_timeout_exhaustion_cleans_partial_bytes_and_redacts_url(tmp_path):
+    clock = Clock(datetime(2026, 7, 14, tzinfo=UTC))
+    signed_url = "https://dashscope-result-1.aliyuncs.com/image.png?signature=never-leak"
+    attempts = 0
+    sleeps: list[float] = []
+
+    class PartialThenTimeout(httpx.SyncByteStream):
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        def __iter__(self):
+            yield b"partial-bytes"
+            raise httpx.ReadTimeout(f"timed out reading {signed_url}", request=self.request)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(200, headers={"content-type": "image/png"}, stream=PartialThenTimeout(request))
+
+    store = make_store(tmp_path, clock, sleeper=sleeps.append)
+    with pytest.raises(TimeoutError) as raised:
+        store.save_downloaded_artifact(
+            kind="image",
+            model_id=IMAGE_MODEL_ID,
+            prompt="prompt",
+            negative_prompt="",
+            request_id="req-timeout-exhausted",
+            latency_ms=1,
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+            download_url=signed_url,
+            usage={},
+            cost=None,
+            mime_prefix="image/",
+        )
+
+    assert attempts == DEFAULT_DOWNLOAD_MAX_ATTEMPTS
+    assert sleeps == [1.0]
+    assert "never-leak" not in str(raised.value)
+    assert not list(store.root_dir.rglob("*.part"))
+    assert not list((store.root_dir / "artifacts").iterdir())
+    assert not list((store.root_dir / "manifests").iterdir())
+    assert DEFAULT_DOWNLOAD_TIMEOUT_SECONDS > 120.0
+
+
 def test_image_request_shape_immediate_download_manifest_inspect_publish_and_restart(tmp_path):
     clock = Clock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
     requests: list[tuple[str, dict[str, str], Any]] = []
@@ -368,6 +537,147 @@ def test_image_request_shape_immediate_download_manifest_inspect_publish_and_res
 
     restarted = ImageGenerationTools(settings=make_settings(), artifact_store=store, http_client=client, clock=clock.monotonic)
     assert restarted.inspect_image(artifact_id)["data"]["artifact"]["artifact_id"] == artifact_id
+
+
+def test_image_timeout_retries_once_with_configured_deadline_then_preserves_real_artifact(tmp_path):
+    clock = Clock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    post_timeouts: list[dict[str, float]] = []
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            post_timeouts.append(request.extensions["timeout"])
+            if len(post_timeouts) == 1:
+                raise httpx.ReadTimeout("provider is still rendering", request=request)
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "req-image-after-timeout",
+                    "output": {"choices": [{"message": {"content": [{"image": IMAGE_URL_1}]}}]},
+                    "usage": {"width": 1792, "height": 1008, "image_count": 1},
+                },
+            )
+        if str(request.url) == IMAGE_URL_1:
+            return httpx.Response(200, headers={"content-type": "image/png"}, content=b"real-image")
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    tools = ImageGenerationTools(
+        settings=make_settings(),
+        artifact_store=make_store(tmp_path, clock),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        clock=clock.monotonic,
+        sleeper=sleeps.append,
+        request_timeout_seconds=123.0,
+    )
+
+    result = tools.generate_images("jury launch visual", width=1792, height=1008)
+
+    assert result["success"] is True
+    assert len(result["data"]["artifact_ids"]) == 1
+    assert len(post_timeouts) == DEFAULT_IMAGE_REQUEST_MAX_ATTEMPTS
+    assert all(timeout["read"] == 123.0 for timeout in post_timeouts)
+    assert sleeps == [2.0]
+    manifest = result["data"]["artifacts"][0]
+    assert manifest["model_id"] == IMAGE_MODEL_ID
+    assert manifest["width"] == 1792
+    assert manifest["height"] == 1008
+    assert manifest["sha256"]
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 503])
+def test_image_transient_http_status_retries_once(status_code, tmp_path):
+    clock = Clock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    post_count = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "POST":
+            post_count += 1
+            if post_count == 1:
+                return httpx.Response(status_code, json={"message": "transient"})
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "req-image-http-retry",
+                    "output": {"choices": [{"message": {"content": [{"image": IMAGE_URL_1}]}}]},
+                    "usage": {"width": 512, "height": 512},
+                },
+            )
+        return httpx.Response(200, headers={"content-type": "image/png"}, content=b"real-image")
+
+    tools = ImageGenerationTools(
+        settings=make_settings(),
+        artifact_store=make_store(tmp_path, clock),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        clock=clock.monotonic,
+        sleeper=sleeps.append,
+    )
+
+    result = tools.generate_images("prompt", width=512, height=512)
+
+    assert result["success"] is True
+    assert post_count == 2
+    assert sleeps == [2.0]
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+def test_image_permanent_http_status_does_not_retry(status_code, tmp_path):
+    clock = Clock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    post_count = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        post_count += 1
+        return httpx.Response(status_code, json={"message": "permanent"})
+
+    tools = ImageGenerationTools(
+        settings=make_settings(),
+        artifact_store=make_store(tmp_path, clock),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        clock=clock.monotonic,
+        sleeper=sleeps.append,
+    )
+
+    result = tools.generate_images("prompt", width=512, height=512)
+
+    assert result["success"] is False
+    assert result["error_code"] == "provider_image_http"
+    assert post_count == 1
+    assert sleeps == []
+    assert "dash-key-secret" not in json.dumps(result)
+
+
+def test_image_timeout_exhaustion_is_bounded_and_secret_safe(tmp_path):
+    clock = Clock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    post_count = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        post_count += 1
+        raise httpx.ReadTimeout("secret provider detail", request=request)
+
+    tools = ImageGenerationTools(
+        settings=make_settings(),
+        artifact_store=make_store(tmp_path, clock),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        clock=clock.monotonic,
+        sleeper=sleeps.append,
+    )
+
+    result = tools.generate_images("prompt", width=512, height=512)
+
+    assert result == {
+        "success": False,
+        "data": {"artifact_ids": []},
+        "error_code": "network_image_timeout",
+        "error_message": "Image request timed out",
+    }
+    assert post_count == DEFAULT_IMAGE_REQUEST_MAX_ATTEMPTS
+    assert sleeps == [2.0]
+    assert DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS > 60.0
 
 
 def test_image_partial_failure_redaction_mime_cap_cleanup_and_fsync(tmp_path):

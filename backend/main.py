@@ -4,9 +4,10 @@ import asyncio
 import hashlib
 import logging
 import mimetypes
+import re
 import sys
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -66,6 +67,45 @@ _INLINE_MEDIA_TYPES = {
     "image/png", "image/jpeg", "image/gif", "image/webp",
     "video/mp4", "video/webm", "video/ogg",
 }
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_ARTIFACT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_HASH_CHUNK_BYTES = 64 * 1024
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash a durable artifact without holding its full content in memory."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_task_relative_path(value: object) -> str | None:
+    """Accept a portable, non-empty path relative to the durable task root."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().replace("\\", "/")
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} or ":" in part for part in parts):
+        return None
+    candidate = PurePosixPath(normalized)
+    if candidate.is_absolute() or not candidate.parts:
+        return None
+    return candidate.as_posix()
+
+
+def _declared_media_type(value: object) -> str | None:
+    """Return only MIME types that are safe for the browser preview contract."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.lower().strip()
+    if normalized in _INLINE_MEDIA_TYPES or normalized == "text/plain":
+        return normalized
+    return None
 
 
 def _safe_artifact_display_path(value: object, fallback: Path) -> str:
@@ -107,6 +147,7 @@ def _apply_artifact_validation_statuses(records: list[dict[str, Any]], task_even
     saw_validation = False
     by_id = {record["id"]: record for record in records}
     by_relative = {record["relative_path"]: record for record in records}
+    by_storage_relative = {record["_storage_relative"]: record for record in records}
     by_filename: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         by_filename.setdefault(record["filename"], []).append(record)
@@ -124,26 +165,29 @@ def _apply_artifact_validation_statuses(records: list[dict[str, Any]], task_even
                 reference = reference.get("id") or reference.get("workspace_relative_path") or reference.get("path")
             if not isinstance(reference, str) or not reference:
                 continue
-            normalized = reference.replace("\\", "/")
-            matched = by_id.get(normalized) or by_relative.get(normalized)
+            normalized = _safe_task_relative_path(reference)
+            # IDs are not paths, but still use the same strict grammar as API
+            # IDs.  Absolute, traversal, and malformed validation references
+            # deliberately do not contribute a validation result.
+            matched = by_id.get(reference) if _ARTIFACT_ID_PATTERN.fullmatch(reference) else None
+            if normalized is not None:
+                matched = matched or by_relative.get(normalized) or by_storage_relative.get(normalized)
             if matched is None:
+                # Older validator events could contain a task-local absolute
+                # path. Correlate it only by exact equality with an already
+                # verified artifact path; the absolute value is never returned.
                 try:
-                    inspected_path = Path(reference).resolve()
+                    absolute_reference = Path(reference)
+                    resolved_reference = absolute_reference.resolve() if absolute_reference.is_absolute() else None
                 except (OSError, ValueError):
-                    inspected_path = None
-                if inspected_path is not None:
-                    matched = next((record for record in records if record["_path"] == inspected_path), None)
-            if matched is None and "/" in normalized and not Path(normalized).is_absolute():
-                # Validators report durable task-relative storage references
-                # (for example ``agentbay/<run>/export.html``). Match those
-                # against the already verified absolute record path.
-                normalized_suffix = f"/{normalized.lstrip('/')}"
-                matched = next(
-                    (record for record in records if record["_path"].as_posix().endswith(normalized_suffix)),
-                    None,
-                )
-            if matched is None:
-                candidates = by_filename.get(Path(normalized).name, [])
+                    resolved_reference = None
+                if resolved_reference is not None:
+                    matched = next(
+                        (record for record in records if record["_path"] == resolved_reference),
+                        None,
+                    )
+            if matched is None and normalized is not None:
+                candidates = by_filename.get(Path(normalized or reference).name, [])
                 if len(candidates) == 1:
                     matched = candidates[0]
             if matched is not None:
@@ -155,7 +199,7 @@ def _apply_artifact_validation_statuses(records: list[dict[str, Any]], task_even
 
 
 def _artifact_records(task_id: str, task_events: list[Any]) -> list[dict[str, Any]]:
-    """Normalize AgentBay export events and verify task-owned bytes before use.
+    """Normalize durable execution and media artifacts for safe API reads.
 
     This is the sole filesystem resolver for artifact API reads. It accepts only
     relative paths beneath the task's durable root, rejects symlinks, and
@@ -164,26 +208,33 @@ def _artifact_records(task_id: str, task_events: list[Any]) -> list[dict[str, An
 
     artifact_root = society._composition_artifact_root(task_id).resolve()
     records: dict[str, dict[str, Any]] = {}
-    for event in task_events:
-        if event.type != "agentbay_artifact_exported":
-            continue
-        payload = event.payload if isinstance(event.payload, dict) else {}
-        ref = payload.get("artifact_ref")
-        if not isinstance(ref, dict):
-            continue
+
+    def record_artifact(payload: dict[str, Any], ref: dict[str, Any]) -> None:
         artifact_id = ref.get("id")
         expected_sha256 = ref.get("sha256")
         storage_path = ref.get("storage_path") or ref.get("path")
-        if not isinstance(artifact_id, str) or not artifact_id or not isinstance(expected_sha256, str) or not isinstance(storage_path, str):
-            continue
-        candidate = Path(storage_path)
-        if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
-            continue
+        if (
+            not isinstance(artifact_id, str)
+            or not _ARTIFACT_ID_PATTERN.fullmatch(artifact_id)
+            or not isinstance(expected_sha256, str)
+            or not _SHA256_PATTERN.fullmatch(expected_sha256.lower())
+        ):
+            return
+        expected_sha256 = expected_sha256.lower()
+        safe_storage_path = _safe_task_relative_path(storage_path)
+        if safe_storage_path is None:
+            return
+        candidate = Path(*PurePosixPath(safe_storage_path).parts)
+        current = artifact_root
+        for part in candidate.parts:
+            current = current / part
+            if current.is_symlink():
+                return
         resolved = (artifact_root / candidate).resolve()
         if resolved == artifact_root or artifact_root not in resolved.parents:
-            continue
+            return
         display_path = _safe_artifact_display_path(payload.get("workspace_relative_path"), resolved)
-        media_type = _artifact_media_type(display_path, ref.get("type"))
+        media_type = _declared_media_type(ref.get("mime_type")) or _artifact_media_type(display_path, ref.get("type"))
         record = {
             "id": artifact_id,
             "filename": Path(display_path).name,
@@ -199,14 +250,19 @@ def _artifact_records(task_id: str, task_events: list[Any]) -> list[dict[str, An
                 else payload.get("role_key") if isinstance(payload.get("role_key"), str)
                 else None
             ),
+            "model_id": ref.get("model_id") if isinstance(ref.get("model_id"), str) else None,
+            "width": ref.get("width") if isinstance(ref.get("width"), int) and not isinstance(ref.get("width"), bool) else None,
+            "height": ref.get("height") if isinstance(ref.get("height"), int) and not isinstance(ref.get("height"), bool) else None,
+            "generation_status": "failed" if payload.get("_generation_failed") is True else "recorded",
             "validation_status": "not_validated",
             "status": "missing",
             "download_url": f"/tasks/{task_id}/artifacts/{artifact_id}",
             "view_url": None,
             "_path": resolved,
+            "_storage_relative": safe_storage_path,
         }
         if resolved.is_file() and not resolved.is_symlink():
-            actual_sha256 = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            actual_sha256 = _sha256_file(resolved)
             if actual_sha256 == expected_sha256:
                 record["status"] = "available"
                 record["size_bytes"] = resolved.stat().st_size
@@ -216,8 +272,83 @@ def _artifact_records(task_id: str, task_events: list[Any]) -> list[dict[str, An
                 record["status"] = "integrity_failed"
         # Later re-emission of the same durable ID replaces stale metadata.
         records[artifact_id] = record
+
+    for event in task_events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.type == "agentbay_artifact_exported":
+            ref = payload.get("artifact_ref")
+            if isinstance(ref, dict):
+                record_artifact(payload, ref)
+            continue
+        if event.type == "composition_media_artifact_recorded":
+            manifest = payload.get("artifact")
+            if not isinstance(manifest, dict):
+                continue
+            local_relative_path = manifest.get("local_relative_path")
+            artifact_id = manifest.get("artifact_id")
+            if not isinstance(local_relative_path, str) or not isinstance(artifact_id, str):
+                continue
+            record_artifact(
+                {
+                    "workspace_relative_path": payload.get("expected_artifact") or Path(local_relative_path).name,
+                    "producer": payload.get("producer"),
+                },
+                {
+                    "id": artifact_id,
+                    "type": manifest.get("kind") or "media",
+                    "storage_path": local_relative_path,
+                    "sha256": manifest.get("sha256"),
+                    "size_bytes": manifest.get("byte_size"),
+                    "mime_type": manifest.get("mime_type"),
+                    "model_id": manifest.get("model_id"),
+                    "width": manifest.get("width"),
+                    "height": manifest.get("height"),
+                },
+            )
+            continue
+        if event.type != "composition_tool_event":
+            continue
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            continue
+        manifests: list[dict[str, Any]] = []
+        if isinstance(data.get("artifact"), dict):
+            manifests.append(data["artifact"])
+        if isinstance(data.get("artifacts"), list):
+            manifests.extend(item for item in data["artifacts"] if isinstance(item, dict))
+        for manifest in manifests:
+            local_relative_path = manifest.get("local_relative_path")
+            artifact_id = manifest.get("artifact_id")
+            if not isinstance(local_relative_path, str) or not isinstance(artifact_id, str):
+                continue
+            legacy_relative = _safe_task_relative_path(local_relative_path)
+            if legacy_relative is None:
+                continue
+            task_relative_storage = (PurePosixPath("media") / PurePosixPath(legacy_relative)).as_posix()
+            media_payload = {
+                "workspace_relative_path": payload.get("expected_artifact") or Path(local_relative_path).name,
+                "producer": payload.get("role_key") or payload.get("template_id") or (
+                    "video_creator" if manifest.get("kind") == "video" else "image_creator"
+                ),
+                "_generation_failed": payload.get("success") is not True,
+            }
+            media_ref = {
+                "id": artifact_id,
+                "type": manifest.get("kind") or "media",
+                "storage_path": task_relative_storage,
+                "sha256": manifest.get("sha256"),
+                "size_bytes": manifest.get("byte_size"),
+                "mime_type": manifest.get("mime_type"),
+                "model_id": manifest.get("model_id"),
+                "width": manifest.get("width"),
+                "height": manifest.get("height"),
+            }
+            record_artifact(media_payload, media_ref)
     values = list(records.values())
     _apply_artifact_validation_statuses(values, task_events)
+    for record in values:
+        if record["generation_status"] == "failed":
+            record["validation_status"] = "failed"
     return values
 
 
@@ -506,7 +637,10 @@ async def task_artifacts(task_id: str) -> list[dict[str, Any]]:
     task_events = society.list_events(task_id)
     if society.get_task_summary(task_id) is None and not task_events:
         raise HTTPException(status_code=404, detail="Task not found")
-    return [{key: value for key, value in item.items() if key != "_path"} for item in _artifact_records(task_id, task_events)]
+    return [
+        {key: value for key, value in item.items() if not key.startswith("_")}
+        for item in _artifact_records(task_id, task_events)
+    ]
 
 
 @app.get("/tasks/{task_id}/artifacts/{artifact_id}")

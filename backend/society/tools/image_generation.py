@@ -19,6 +19,9 @@ MIN_PIXELS = 512 * 512
 MAX_PIXELS = 2048 * 2048
 MAX_IMAGE_COUNT = 6
 MAX_SEED = 2_147_483_647
+DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS = 180.0
+DEFAULT_IMAGE_REQUEST_MAX_ATTEMPTS = 2
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429})
 
 
 class ImageGenerationTools(Toolkit):
@@ -32,6 +35,9 @@ class ImageGenerationTools(Toolkit):
         http_client: httpx.Client,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
         clock: Callable[[], float] | None = None,
+        sleeper: Callable[[float], None] | None = None,
+        request_timeout_seconds: float = DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
+        request_max_attempts: int = DEFAULT_IMAGE_REQUEST_MAX_ATTEMPTS,
     ) -> None:
         super().__init__(name="image_generation_tools", auto_register=False)
         self._settings = settings
@@ -39,8 +45,74 @@ class ImageGenerationTools(Toolkit):
         self._http_client = http_client
         self._event_sink = event_sink
         self._clock = clock or time.monotonic
+        self._sleeper = sleeper or time.sleep
+        self._request_timeout_seconds = float(request_timeout_seconds)
+        self._request_max_attempts = int(request_max_attempts)
+        if self._request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        if self._request_max_attempts < 1:
+            raise ValueError("request_max_attempts must be at least one")
         for name in ("generate_images", "inspect_image", "publish_image"):
             self.register(getattr(self, name))
+
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        """Return whether repeating a real generation request can recover safely."""
+
+        return status_code in _RETRYABLE_HTTP_STATUS_CODES or status_code >= 500
+
+    def _retry_delay_seconds(self, attempt: int) -> float:
+        """Compute a bounded delay after a failed one-based attempt."""
+
+        base = max(0.0, float(self._settings.provider_backoff_base_seconds))
+        cap = max(0.0, float(self._settings.provider_backoff_cap_seconds))
+        return min(cap, base * (2 ** max(0, attempt - 1)))
+
+    def _request_generation_payload(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        request_body: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any] | None, str | None, str | None]:
+        """Call Qwen Image with bounded retries and return a stable error envelope.
+
+        A timeout or transient provider/transport failure gets one bounded retry by
+        default. Permanent client errors (including authentication and request
+        validation failures) are returned immediately so a bad request is never
+        amplified into repeated provider calls.
+        """
+
+        for attempt in range(1, self._request_max_attempts + 1):
+            try:
+                response = self._http_client.post(
+                    url,
+                    headers=headers,
+                    json=request_body,
+                    timeout=self._request_timeout_seconds,
+                )
+                response.raise_for_status()
+                return response.json(), None, None
+            except httpx.TimeoutException:
+                error_code = "network_image_timeout"
+                error_message = "Image request timed out"
+                retryable = True
+            except httpx.HTTPStatusError as exc:
+                error_code = "provider_image_http"
+                error_message = str(exc)
+                retryable = self._is_retryable_status(exc.response.status_code)
+            except httpx.RequestError as exc:
+                error_code = "provider_image_http"
+                error_message = str(exc)
+                retryable = True
+            except ValueError as exc:
+                return None, "provider_image_json", str(exc)
+
+            if not retryable or attempt >= self._request_max_attempts:
+                return None, error_code, error_message
+            self._sleeper(self._retry_delay_seconds(attempt))
+
+        raise AssertionError("bounded image request loop exited unexpectedly")
 
     def _success(self, *, data: Mapping[str, Any], error_code: str | None = None, error_message: str | None = None) -> dict[str, Any]:
         payload = {
@@ -137,24 +209,21 @@ class ImageGenerationTools(Toolkit):
         if seed is not None:
             request_body["parameters"]["seed"] = int(seed)
         base_url = validate_model_studio_base_url(self._settings.resolved_model_studio_base_url)
-        try:
-            response = self._http_client.post(
-                f"{base_url}/services/aigc/multimodal-generation/generation",
-                headers={
-                    "Authorization": f"Bearer {self._settings.media_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=request_body,
-                timeout=60.0,
+        payload, provider_error_code, provider_error_message = self._request_generation_payload(
+            url=f"{base_url}/services/aigc/multimodal-generation/generation",
+            headers={
+                "Authorization": f"Bearer {self._settings.media_api_key}",
+                "Content-Type": "application/json",
+            },
+            request_body=request_body,
+        )
+        if provider_error_code is not None:
+            return self._success(
+                data={"artifact_ids": []},
+                error_code=provider_error_code,
+                error_message=provider_error_message,
             )
-            response.raise_for_status()
-            payload = response.json()
-        except httpx.TimeoutException:
-            return self._success(data={"artifact_ids": []}, error_code="network_image_timeout", error_message="Image request timed out")
-        except httpx.HTTPError as exc:
-            return self._success(data={"artifact_ids": []}, error_code="provider_image_http", error_message=str(exc))
-        except ValueError as exc:
-            return self._success(data={"artifact_ids": []}, error_code="provider_image_json", error_message=str(exc))
+        assert payload is not None
 
         request_id = str(payload.get("request_id") or "")
         usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}

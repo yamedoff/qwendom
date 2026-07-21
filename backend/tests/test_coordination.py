@@ -233,6 +233,154 @@ class DemoProofTests(unittest.TestCase):
         self.assertEqual([item[0] for item in emitted], ["goal_discussion_started", "agent_contribution_unavailable"])
         self.assertNotIn("could not provide a structured tool response", str(emitted))
 
+    def test_targeted_question_routes_to_named_role_owner_instead_of_next_roster_member(self) -> None:
+        """A question names the capable teammate rather than following round-robin order."""
+
+        from society.orchestrator import SocietyOrchestrator
+
+        state = {
+            "discussion_round_count": 1,
+            "goal_discussions": [
+                {
+                    "round": 1,
+                    "agent_id": "architect",
+                    "question_for_next": "Does this violate an acceptance constraint?",
+                    "question_target_agent_id": "critic",
+                    "unique_contribution": "The system boundary is defined.",
+                }
+            ],
+            "targeted_question_exchanges": [],
+            "conversation_transcript": [],
+        }
+        orchestrator = SocietyOrchestrator.__new__(SocietyOrchestrator)
+        orchestrator.agents = {
+            "researcher": SocietyAgent(
+                id="researcher",
+                name="Researcher",
+                role="Research Analyst",
+                skills=["evidence"],
+                profile=AgentProfile(),
+            ),
+            "critic": SocietyAgent(
+                id="critic",
+                name="Noor",
+                role="Adversarial Reviewer",
+                skills=["validation"],
+                profile=AgentProfile(),
+            ),
+        }
+        orchestrator._state = lambda _task_id: state
+        orchestrator._emit = lambda *_args, **_kwargs: None
+        asked: list[tuple[str, str, str, str]] = []
+
+        async def ask_agent(identity, prompt, context, task_id):
+            asked.append((identity.id, prompt, context, task_id))
+            return "It violates the acceptance constraint until an independent test records the exact failure."
+
+        orchestrator._ask_agent = ask_agent
+
+        asyncio.run(
+            orchestrator._run_targeted_question_exchange(
+                SimpleNamespace(id="task-1", prompt="Ship a safe artifact"),
+                SimpleNamespace(member_ids=["architect", "researcher", "critic"]),
+            )
+        )
+
+        exchange = state["targeted_question_exchanges"][0]
+        self.assertEqual(exchange["target_agent_id"], "critic")
+        self.assertEqual(
+            exchange["answer"],
+            "It violates the acceptance constraint until an independent test records the exact failure.",
+        )
+        self.assertEqual(state["goal_discussions"][-1]["agent_id"], "critic")
+        self.assertEqual(state["goal_discussions"][-1]["responds_to"], "architect")
+        self.assertEqual(asked[0][0], "critic")
+        self.assertIn("architect asked you directly", asked[0][2])
+
+    def test_targeted_question_provider_failure_does_not_fabricate_an_answer(self) -> None:
+        """A failed real agent call remains visible instead of becoming canned dialogue."""
+
+        from society.orchestrator import SocietyOrchestrator
+
+        state = {
+            "discussion_round_count": 1,
+            "goal_discussions": [{
+                "round": 1,
+                "agent_id": "architect",
+                "question_for_next": "Which acceptance risk remains unverified?",
+                "question_target_agent_id": "critic",
+            }],
+            "targeted_question_exchanges": [],
+        }
+        emitted: list[tuple[str, dict]] = []
+        orchestrator = SocietyOrchestrator.__new__(SocietyOrchestrator)
+        orchestrator.agents = {
+            "critic": SocietyAgent(
+                id="critic",
+                name="Noor",
+                role="Adversarial Reviewer",
+                skills=["validation"],
+                profile=AgentProfile(),
+            ),
+        }
+        orchestrator._state = lambda _task_id: state
+        orchestrator._emit = lambda _task_id, event_type, _message, **kwargs: emitted.append((event_type, kwargs.get("payload", {})))
+
+        async def unavailable(*_args, **_kwargs):
+            raise RuntimeError("provider unavailable")
+
+        orchestrator._ask_agent = unavailable
+
+        asyncio.run(
+            orchestrator._run_targeted_question_exchange(
+                SimpleNamespace(id="task-1", prompt="Ship a safe artifact"),
+                SimpleNamespace(member_ids=["architect", "critic"]),
+            )
+        )
+
+        self.assertEqual(state["targeted_question_exchanges"], [])
+        self.assertEqual(emitted[0][0], "targeted_question_unavailable")
+        self.assertIn("provider unavailable", emitted[0][1]["reason"])
+
+    def test_procedural_targeted_question_is_rejected_without_fabricating_a_reply(self) -> None:
+        """Older replay events cannot recreate ceremonial round-robin debate."""
+
+        from society.orchestrator import SocietyOrchestrator
+
+        state = {
+            "discussion_round_count": 1,
+            "goal_discussions": [{
+                "round": 1,
+                "agent_id": "architect",
+                "question_for_next": "Are we ready to proceed?",
+                "question_target_agent_id": "critic",
+            }],
+            "targeted_question_exchanges": [],
+        }
+        emitted: list[tuple[str, dict]] = []
+        orchestrator = SocietyOrchestrator.__new__(SocietyOrchestrator)
+        orchestrator.agents = {
+            "critic": SocietyAgent(
+                id="critic",
+                name="Noor",
+                role="Adversarial Reviewer",
+                skills=["validation"],
+                profile=AgentProfile(),
+            ),
+        }
+        orchestrator._state = lambda _task_id: state
+        orchestrator._emit = lambda _task_id, event_type, _message, **kwargs: emitted.append((event_type, kwargs.get("payload", {})))
+
+        asyncio.run(
+            orchestrator._run_targeted_question_exchange(
+                SimpleNamespace(id="task-1", prompt="Ship a safe artifact"),
+                SimpleNamespace(member_ids=["architect", "critic"]),
+            )
+        )
+
+        self.assertEqual(state["targeted_question_exchanges"], [])
+        self.assertEqual(emitted[0][0], "targeted_question_rejected")
+
     def test_parse_coordination_brief_falls_back_to_raw_content(self) -> None:
         from society.orchestrator import SocietyOrchestrator
 
